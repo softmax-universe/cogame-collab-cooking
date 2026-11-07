@@ -25,7 +25,7 @@ from collab_cooking.kitchens.layouts import (  # noqa: E402
 )
 
 IMAGE = "{{COLLAB_COOKING_IMAGE}}"
-SOURCE_URL = "https://github.com/Metta-AI/cogame-collab-cooking/tree/main"
+SOURCE_URL = "https://github.com/softmax-universe/cogame-collab-cooking/tree/main"
 GAME_NAME = "collab_cooking"
 OWNER = "daveey@softmax.com"
 SLUG = "collab-cooking"
