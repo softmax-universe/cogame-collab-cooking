@@ -34,8 +34,8 @@ standalone = []
 test = ["pytest>=8.0.0"]
 
 [project.urls]
-Homepage = "https://github.com/Metta-AI/cogame-collab-cooking"
-Repository = "https://github.com/Metta-AI/cogame-collab-cooking.git"
+Homepage = "https://github.com/softmax-universe/cogame-collab-cooking"
+Repository = "https://github.com/softmax-universe/cogame-collab-cooking.git"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/collab_cooking"]
