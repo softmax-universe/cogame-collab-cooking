@@ -87,22 +87,38 @@ def test_clean_json_parses() -> None:
     assert plan.say == "on it" and plan.note == "private"
 
 
-def test_trailing_and_leading_prose_is_tolerated() -> None:
-    assert parse_plan('Sure! {"station":"sink"} hope that helps', LEGAL, ALLIES).station == "sink"
-    assert parse_plan('{"station":"board"}\n\nLet me know.', LEGAL, ALLIES).station == "board"
-    # A brace inside a string literal does not end the object.
+def test_markdown_json_fence_is_accepted_and_surrounding_prose_is_rejected() -> None:
+    assert parse_plan('```json\n{"station":"sink"}\n```', LEGAL, ALLIES).station == "sink"
+    assert parse_plan('```\n{"station":"board"}\n```', LEGAL, ALLIES).station == "board"
+    # A brace inside a string literal does not break JSON parsing.
     assert parse_plan('{"station":"veg","say":"} not the end"}', LEGAL, ALLIES).say == "} not the end"
+    # Surrounding prose is rejected rather than scraped.
+    for prose in (
+        'Sure! {"station":"sink"} hope that helps',
+        '{"station":"board"}\n\nLet me know.',
+        'Here it is:\n```json\n{"station":"sink"}\n```',
+    ):
+        with pytest.raises(PlanError) as error:
+            parse_plan(prose, LEGAL, ALLIES)
+        assert error.value.cause == "parse"
 
 
-def test_missing_fields_default_rather_than_failing() -> None:
+def test_omitted_optional_fields_default_and_invalid_explicit_values_are_rejected() -> None:
     plan = parse_plan('{"station":"veg"}', LEGAL, ALLIES)
     assert (plan.recipe, plan.zone, plan.handoff, plan.yield_to) == ("any", "any", "none", "none")
     assert plan.say == "" and plan.note == ""
-    junk = parse_plan(
-        '{"station":"veg","recipe":"pizza","zone":"middle","handoff":"Cog-Z","yield_to":7}',
-        LEGAL, ALLIES,
-    )
-    assert (junk.recipe, junk.zone, junk.handoff, junk.yield_to) == ("any", "any", "none", "none")
+
+    for bad in (
+        '{"station":"veg","recipe":"pizza"}',
+        '{"station":"veg","zone":"middle"}',
+        '{"station":"veg","handoff":"Cog-Z"}',
+        '{"station":"veg","yield_to":7}',
+        '{"station":"veg","say":123}',
+        '{"station":"veg","note":["not","a","str"]}',
+    ):
+        with pytest.raises(PlanError) as error:
+            parse_plan(bad, LEGAL, ALLIES)
+        assert error.value.cause == "invalid_field"
 
 
 def test_a_station_outside_the_legal_set_is_illegal() -> None:
@@ -149,17 +165,23 @@ def test_one_parallel_batch_issues_every_seat_at_once() -> None:
     assert len(transport.calls) == 4
 
 
-def test_an_illegal_station_triggers_exactly_one_retry_then_the_fallback() -> None:
+def test_an_illegal_station_triggers_exactly_one_retry_then_rejection_preserving_raw() -> None:
     transport = StubTransport(['{"station":"pot"}', '{"station":"pot"}', '{"station":"pot"}'])
     planner = LlmPlanner(transport=transport, max_workers=1, timeout_seconds=5)
-    batch = planner.start_turn(1, [request(0)])
+    req = request(0)
+    batch = planner.start_turn(1, [req])
     outcomes = drain(planner, batch)
     planner.shutdown()
     assert len(transport.calls) == 2, "one call, one retry, then give up"
-    assert "not usable" in transport.calls[1][1], "the retry carries the hint"
+    assert "rejected" in transport.calls[1][1], "the retry carries the hint"
     outcome = outcomes[0]
     assert not outcome.ok and outcome.cause == "illegal_station"
-    assert outcome.src == "fallback:illegal_station"
+    assert outcome.src == "rejected:illegal_station"
+    assert outcome.raw_response == '{"station":"pot"}'
+    attempts = planner.evidence[req.decision_id]
+    assert len(attempts) == 2
+    assert all(not a["accepted"] and a["response"] == '{"station":"pot"}' for a in attempts)
+    assert all("illegal_station" in a["rejection_reason"] for a in attempts)
 
 
 def test_a_retry_that_succeeds_is_used() -> None:
@@ -215,11 +237,14 @@ def test_no_credentials_means_zero_network_calls_and_immediate_fallbacks(monkeyp
 
 
 # -- the prompt ------------------------------------------------------------
-def test_the_system_prompt_demands_a_reply_that_begins_with_a_brace() -> None:
+def test_the_system_prompt_documents_canonical_json_and_example() -> None:
     prompt = build_system_prompt(
         "Cog-C", 900, "forced", "two sealed halves", 50, "keep the pot busy", selection=PromptSelection()
     )
-    assert "MUST begin with the character {" in prompt
+    assert "single JSON object" in prompt
+    assert "```json" in prompt
+    assert "Example:" in prompt
+    assert '{"station":"chop"' in prompt
     assert "Cog-C" in prompt and "forced" in prompt
     assert "STANDING ORDERS: keep the pot busy" in prompt
     assert "effort" not in prompt

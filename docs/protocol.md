@@ -23,8 +23,8 @@ policy needs to decode the token array.
 {"type":"register","kind":"external"}
 ```
 
-An unknown baseline, a malformed frame, or no registration within 5 s of connect is treated as
-`{"kind":"scripted","baseline":"brigade"}` -- never a disconnect.
+An unknown kind, unknown baseline, or malformed frame increments `malformed_frame` and is
+not silently coerced to a scripted baseline.
 An `external` seat makes its own decisions over the same observation and action
 frames as every other seat. The game does not plan or call a model for it.
 
@@ -49,9 +49,10 @@ centre).
  "say":"I'll keep the board fed, D takes the middle counter","note":"","src":"llm"}
 ```
 
-`src` is `"llm"` or `"fallback:<cause>"`; a fallback carries an empty `station`, which means "drop
-the directive and run your baseline". Scripted seats never receive this message.
-External seats never receive it either.
+`src` is `"llm"` (`"accepted": true`) or `"rejected:<cause>"` (`"accepted": false`, empty
+`station`). A rejected plan clears the active directive without falling back to a scripted
+baseline; the player sends no synthesized action and the clocked engine advances with recorded
+missed turns until a valid plan lands. Scripted seats and external seats never receive this message.
 
 ## player -> game, every tick: `action`
 

@@ -177,8 +177,9 @@ def test_every_baseline_name_is_selectable_and_resolves_a_role() -> None:
     assert roles["runner"] == "all_rounder"
     assert roles["courier"] == "server"
     assert roles["passer"] == "all_rounder"
-    # An unknown baseline silently becomes the default rather than crashing.
-    assert KitchenBrain(pei, 0, layout="cramped", baseline="wat").baseline == "brigade"
+    # An unknown baseline is rejected explicitly rather than silently falling back.
+    with pytest.raises(ValueError, match="unknown baseline"):
+        KitchenBrain(pei, 0, layout="cramped", baseline="wat")
 
 
 def test_decode_observation_drops_empty_tokens_and_keeps_the_rest() -> None:

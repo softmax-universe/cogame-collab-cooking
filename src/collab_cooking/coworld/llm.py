@@ -2,7 +2,7 @@
 
 Hosted requests prefer COWORLD_LLM_ENDPOINT, carry the requesting seat, and
 use canonical OpenRouter models. Local play can use provider credentials.
-The game owns parallel dispatch, retries, and its scripted fallback.
+The game owns parallel dispatch, retries, and explicit rejection reporting.
 """
 
 from __future__ import annotations
@@ -62,6 +62,7 @@ class PlanOutcome:
     cause: str = ""
     detail: str = ""
     requests: int = 0
+    raw_response: str = ""
 
     @property
     def ok(self) -> bool:
@@ -69,14 +70,14 @@ class PlanOutcome:
 
     @property
     def src(self) -> str:
-        return "llm" if self.ok else f"fallback:{self.cause}"
+        return "llm" if self.ok else f"rejected:{self.cause}"
 
 
 class RateBudget:
     """A rolling requests-per-minute budget shared by every seat.
 
-    Retries draw from it, and a request that would exceed it is simply not
-    made -- the seat plays its fallback for that turn with `rate_budget`.
+    Retries draw from it, and a request that would exceed it is not made --
+    the plan turn is explicitly rejected with `rate_budget`.
     """
 
     def __init__(self, max_per_minute: int) -> None:
@@ -336,17 +337,23 @@ class LlmPlanner:
 
     # -- worker -------------------------------------------------------------
     def _one_seat(self, request: PlanRequest) -> PlanOutcome:
-        """Call, parse, retry once, else fall back. Never raises."""
+        """Call, parse, retry once, else report explicit rejection. Never raises."""
         if self._transport is None:
             return PlanOutcome(slot=request.slot, plan=None, cause="disabled")
         used = 0
         cause = "transport"
         detail = ""
+        last_raw = ""
         user = request.user
         for attempt in (0, 1):
             if not self.budget.take():
                 return PlanOutcome(
-                    slot=request.slot, plan=None, cause="rate_budget", detail="26 req/min", requests=used
+                    slot=request.slot,
+                    plan=None,
+                    cause="rate_budget",
+                    detail="26 req/min",
+                    requests=used,
+                    raw_response=last_raw,
                 )
             used += 1
             with self._requests_lock:
@@ -369,16 +376,17 @@ class LlmPlanner:
                 detail = truncate_runes(message, ERROR_RUNES)
                 _log(f"slot {request.slot} attempt {attempt}: {cause} {detail}")
             else:
+                receipt["response"] = text
+                last_raw = text
                 try:
                     plan = parse_plan(text, request.legal_stations, request.ally_aliases)
                 except PlanError as exc:
                     cause, detail = exc.cause, exc.detail
                     _log(f"slot {request.slot} attempt {attempt}: {cause} {detail}")
                 else:
-                    receipt["response"] = text
                     receipt["parsed_action"] = {key: getattr(plan, key) for key in plan.__dataclass_fields__}
                     receipt["accepted"] = True
-                    return PlanOutcome(slot=request.slot, plan=plan, requests=used)
+                    return PlanOutcome(slot=request.slot, plan=plan, requests=used, raw_response=text)
             finally:
                 receipt["latency_ms"] = (time.monotonic() - started) * 1000
                 if isinstance(self._transport, _Transport):
@@ -388,7 +396,14 @@ class LlmPlanner:
 
             if attempt == 0:
                 user = f"{request.user}\n\n{RETRY_HINT}"
-        return PlanOutcome(slot=request.slot, plan=None, cause=cause, detail=detail, requests=used)
+        return PlanOutcome(
+            slot=request.slot,
+            plan=None,
+            cause=cause,
+            detail=detail,
+            requests=used,
+            raw_response=last_raw,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -401,11 +416,15 @@ class LlmPlanner:
 SYSTEM_TEMPLATE = """Kitchen: {layout} - {layout_line}
 You give one standing order; a controller walks you there tick by tick until your next order,
 about {plan_interval} ticks from now.
-Reply with a single JSON object and NOTHING else. Your reply MUST begin with the character {{.
+Reply with ONLY a single JSON object (optionally in a ```json ... ``` fence) and no extra prose.
 Schema:
 {{"station":"<one of LEGAL STATIONS>","recipe":"salad|soup|fries|any","zone":"left|right|pass|any",
  "handoff":"<ally alias or none>","yield_to":"<ally alias or none>",
  "say":"<=120 chars","note":"<=200 chars"}}
+Only "station" is required; omitted fields default to recipe="any", zone="any", handoff="none",
+yield_to="none", say="", note="".
+Example:
+{{"station":"chop","recipe":"soup","zone":"any","handoff":"none","yield_to":"none","say":"Chopping veg for soup","note":""}}
 "say" is heard by your team-mates next turn and shown to spectators. "note" is private and is
 handed back only to you."""
 

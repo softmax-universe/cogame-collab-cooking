@@ -42,6 +42,11 @@ def write_capture(episode, results: dict) -> None:
             elif not receipt.get("rejection_reason"):
                 receipt["rejection_reason"] = "response was not applied before episode/plan deadline"
             attempts.append(DecisionAttempt.model_validate(receipt))
+        status = row["status"]
+        if displaced and selected is None:
+            status = "rejected"
+        elif status != "accepted":
+            status = "rejected" if attempts else "missing"
         events.append(
             DecisionEvent(
                 **identity,
@@ -52,9 +57,9 @@ def write_capture(episode, results: dict) -> None:
                 prompt=[{"role": "system", "content": request.system}, {"role": "user", "content": request.user}],
                 attempts=attempts,
                 selected_attempt_id=selected,
-                executed_action=row["action"],
-                action_status="rejected" if displaced and selected is None else row["status"],
-                fallback_origin="player_scripted" if row["status"] == "fallback" else None,
+                executed_action=row["action"] if status == "accepted" else None,
+                action_status=status,
+                fallback_origin=None,
             )
         )
     pending = episode.batch is not None and any(not future.done() for future in episode.batch.futures.values())

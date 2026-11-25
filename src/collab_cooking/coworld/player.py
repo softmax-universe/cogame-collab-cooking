@@ -77,7 +77,9 @@ def registration() -> dict[str, Any]:
         return {"type": "register", "kind": "prompt", "prompt": truncate_runes(prompt, PROMPT_RUNES)}
     baseline = (os.environ.get("PLAYER_SCRIPTED") or "").strip().lower()
     if baseline not in BASELINE_NAMES:
-        baseline = DEFAULT_BASELINE
+        raise ValueError(
+            f"PLAYER_PROMPT or a valid PLAYER_SCRIPTED ({', '.join(BASELINE_NAMES)}) is required, got {baseline!r}"
+        )
     return {"type": "register", "kind": "scripted", "baseline": baseline}
 
 
@@ -88,37 +90,51 @@ class Seat:
         self.slot = 0
         self.alias = "Cog-A"
         self.layout = "open-kitchen"
+        self.kind = "scripted"
         self.pei: PolicyEnvInterface | None = None
         self.brain: KitchenBrain | None = None
         self.state: Any = None
         self.baseline = DEFAULT_BASELINE
         self.aliases: list[str] = []
 
-    def configure(self, message: dict[str, Any], baseline: str) -> None:
+    def configure(self, message: dict[str, Any], baseline: str, *, kind: str = "scripted") -> None:
         self.slot = int(message.get("slot", 0))
         self.alias = str(message.get("alias", f"Cog-{self.slot}"))
         self.layout = str(message.get("layout", "open-kitchen"))
+        self.kind = kind
         self.baseline = baseline
         self.pei = PolicyEnvInterface.model_validate(message["policy_env"])
-        self.brain = KitchenBrain(self.pei, self.slot, layout=self.layout, baseline=baseline)
+        self.brain = KitchenBrain(
+            self.pei,
+            self.slot,
+            layout=self.layout,
+            baseline=baseline,
+            require_plan=(kind == "prompt"),
+        )
         self.state = self.brain.initial_agent_state()
 
-    def act(self, raw_observation: list[list[int]]) -> tuple[str, str]:
+    def act(self, raw_observation: list[list[int]]) -> tuple[str, str] | None:
         if self.brain is None or self.pei is None or self.state is None:
-            return "noop", "waiting"
+            return None
         observation = decode_observation(self.pei, raw_observation, self.slot)
+        if self.kind == "prompt" and self.state.plan is None:
+            # Prompt seats never fall back to a scripted baseline or synthesize
+            # a no-op when no accepted plan is active.
+            self.state = self.brain.observe_only(observation, self.state)
+            return None
         action, self.state = self.brain.step_with_state(observation, self.state)
         return action.name, truncate_runes(action.talk or self.state.current_task, TALK_RUNES)
 
-    def observe(self, message: dict[str, Any]) -> tuple[str, str]:
+    def observe(self, message: dict[str, Any]) -> tuple[str, str] | None:
         return self.act(message["observation"])
 
     def apply_plan(self, message: dict[str, Any]) -> None:
         if self.brain is None or self.state is None:
             return
         station = str(message.get("station", ""))
-        if not station:
-            # A fallback plan: drop the directive and run the baseline.
+        if not station or message.get("accepted") is False:
+            # Rejected or missing plan: clear the active directive without
+            # falling back to any scripted baseline.
             self.brain.apply_plan(self.state, None)
             return
         self.brain.apply_plan(
@@ -166,12 +182,15 @@ async def run_player(url: str, seat: Seat, register: dict[str, Any]) -> None:
             message: dict[str, Any] = json.loads(raw_message)
             kind = message.get("type")
             if kind == "player_config":
-                seat.configure(message, baseline)
+                seat.configure(message, baseline, kind=register["kind"])
                 await websocket.send(json.dumps(register))
                 _log(f"slot {seat.slot} ({seat.alias}) registered as {register['kind']} on {seat.layout}")
             elif kind == "observation":
                 step = int(message.get("step", 0))
-                action_name, task = seat.observe(message)
+                decision = seat.observe(message)
+                if decision is None:
+                    continue
+                action_name, task = decision
                 await websocket.send(
                     json.dumps(
                         {

@@ -136,7 +136,9 @@ def test_the_re_derivation_is_not_vacuous(document: dict) -> None:
     ticks = document["ticks"]
     assert len(ticks) == 240
     assert sum(len(tick.get("ev", [])) for tick in ticks) > 100
-    assert sum(1 for tick in ticks if "st" in tick) > 100
+    # Slot 0 is a prompt seat with no credentials (no brigade fallback), so
+    # three scripted seats drive station updates while slot 0 records missed turns.
+    assert sum(1 for tick in ticks if "st" in tick) > 40
     carried = {entry[2] for tick in ticks for entry in tick["c"]}
     assert len(carried) > 2, carried
 

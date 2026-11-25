@@ -120,13 +120,13 @@ class Seat:
     slot: int
     alias: str
     name: str
-    kind: str = "scripted"
-    baseline: str = DEFAULT_BASELINE
+    kind: str = "unregistered"
+    baseline: str = ""
     prompt: str = ""
     registered: bool = False
     connected: bool = False
     ever_connected: bool = False
-    fallbacks: int = 0
+    plan_rejections: int = 0
     action_fallbacks: dict[str, int] = field(
         default_factory=lambda: {"invalid_action": 0, "deadline": 0, "disconnected": 0, "malformed_frame": 0}
     )
@@ -143,6 +143,7 @@ class Seat:
     ally_memory: dict[str, tuple[tuple[int, int], int, str]] = field(default_factory=dict)
     seen_step: int = 0
     plan_pending: bool = False
+    has_active_plan: bool = False
     plan_delivered_step: int = -1
 
     @property
@@ -167,7 +168,6 @@ class EpisodeConfig:
     min_plan_interval_seconds: float = 10.0
     plan_timeout_seconds: float = 12.0
     llm_max_requests_per_minute: int = 26
-    fallback_scripted: str = DEFAULT_BASELINE
     play_budget_fraction: float = 0.6
     episode_timeout_seconds: float = 1200.0
     shutdown_grace_seconds: float = 20.0
@@ -263,7 +263,6 @@ class LiveMettaGridEpisode:
                 name=truncate_runes(
                     player_names[slot] if slot < len(player_names) else f"seat-{slot}", POLICY_NAME_RUNES
                 ),
-                baseline=config.fallback_scripted,
             )
             for slot in range(len(self.tokens))
         ]
@@ -406,21 +405,29 @@ class LiveMettaGridEpisode:
         self._policy_action_event.set()
 
     def _register(self, seat: Seat, message: PlayerClientMessage) -> None:
-        """An unknown baseline, a malformed frame, or no registration within
-        5 s of connect is treated as `{"kind":"scripted","baseline":"brigade"}`
-        -- never a disconnect."""
-        seat.registered = True
+        """Accept explicit `prompt`, `scripted` (with valid baseline), or `external`
+        registration. Unknown kinds or baselines are rejected as malformed frames
+        without silently substituting a scripted baseline."""
         kind = (message.kind or "").strip().lower()
         if kind == "prompt":
+            seat.registered = True
             seat.kind = "prompt"
+            seat.baseline = ""
             seat.prompt = truncate_runes(message.prompt, PROMPT_RUNES)
             return
         if kind == "external":
+            seat.registered = True
             seat.kind = "external"
+            seat.baseline = ""
             return
-        seat.kind = "scripted"
-        baseline = (message.baseline or "").strip().lower()
-        seat.baseline = baseline if baseline in BASELINE_NAMES else self.config.fallback_scripted
+        if kind == "scripted":
+            baseline = (message.baseline or "").strip().lower()
+            if baseline in BASELINE_NAMES:
+                seat.registered = True
+                seat.kind = "scripted"
+                seat.baseline = baseline
+                return
+        seat.action_fallbacks["malformed_frame"] += 1
 
     # -- the loop -----------------------------------------------------------
     async def run(self) -> None:
@@ -487,10 +494,6 @@ class LiveMettaGridEpisode:
             if all(self.seats[slot].registered for slot in self.connected_slots()):
                 break
             await asyncio.sleep(0.02)
-        for seat in self.seats:
-            if not seat.registered:
-                seat.kind = "scripted"
-                seat.baseline = self.config.fallback_scripted
         if self.writer is not None:
             self.writer.seats = [self.seat_block(seat) for seat in self.seats]
 
@@ -511,7 +514,9 @@ class LiveMettaGridEpisode:
     def _policy_actions_ready(self, step: int) -> bool:
         expected = f"step-{step}"
         return all(
-            not self.connections_by_slot[slot] or self.latest_policy_actions[slot].request_id == expected
+            not self.connections_by_slot[slot]
+            or (self.seats[slot].kind == "prompt" and not self.seats[slot].has_active_plan)
+            or self.latest_policy_actions[slot].request_id == expected
             for slot in range(len(self.tokens))
         )
 
@@ -628,7 +633,7 @@ class LiveMettaGridEpisode:
 
     def _plan_boundary(self, step: int) -> None:
         if self.planner is None or self.planner.disabled:
-            self._fallback_all("disabled", step)
+            self._reject_all("disabled", step)
             return
         if step % self.config.plan_interval_steps != 0:
             return
@@ -650,16 +655,16 @@ class LiveMettaGridEpisode:
                 {
                     "request": request,
                     "turn": self.turn,
-                    "action": {"station": "", "baseline": self.config.fallback_scripted},
-                    "status": "fallback",
+                    "action": None,
+                    "status": "missing",
                 }
             )
         for seat in seats:
             seat.plan_pending = True
         self.batch = self.planner.start_turn(self.turn, requests)
 
-    def _fallback_all(self, cause: str, step: int) -> None:
-        """No LLM at all: every prompt seat plays its baseline all episode."""
+    def _reject_all(self, cause: str, step: int) -> None:
+        """No LLM transport configured: record missed/rejected plan turns with no baseline fallback."""
         if step % self.config.plan_interval_steps != 0:
             return
         seats = self._prompt_seats()
@@ -667,16 +672,17 @@ class LiveMettaGridEpisode:
             return
         self.turn += 1
         for seat in seats:
+            seat.has_active_plan = False
             self._private_plans.append(
                 {
                     "request": self._plan_request(seat),
                     "turn": self.turn,
-                    "action": {"station": "", "baseline": self.config.fallback_scripted},
-                    "status": "fallback",
+                    "action": None,
+                    "status": "missing",
                 }
             )
-            seat.fallbacks += 1
-            self._push_event({"ev": "fallback", "slot": seat.slot, "alias": seat.alias, "cause": cause})
+            seat.plan_rejections += 1
+            self._push_event({"ev": "plan_rejected", "slot": seat.slot, "alias": seat.alias, "cause": cause})
 
     def _plan_request(self, seat: Seat) -> PlanRequest:
         view = self._seat_view(seat)
@@ -859,6 +865,7 @@ class LiveMettaGridEpisode:
                 private["status"] = "accepted"
             if outcome.ok and outcome.plan is not None:
                 plan = outcome.plan
+                seat.has_active_plan = True
                 seat.say = plan.say
                 seat.note = plan.note
                 seat.last_order = f"station={plan.station} recipe={plan.recipe} zone={plan.zone} handoff={plan.handoff}"
@@ -876,6 +883,7 @@ class LiveMettaGridEpisode:
                         "protocol": PLAYER_PROTOCOL,
                         "turn": self.batch.turn,
                         "step": int(self.sim.current_step),
+                        "accepted": True,
                         "station": plan.station,
                         "recipe": plan.recipe,
                         "zone": plan.zone,
@@ -888,12 +896,24 @@ class LiveMettaGridEpisode:
                 )
                 seat.plan_delivered_step = int(self.sim.current_step)
             else:
-                seat.fallbacks += 1
-                self._push_event({"ev": "fallback", "slot": seat.slot, "alias": seat.alias, "cause": outcome.cause})
+                seat.has_active_plan = False
+                seat.plan_rejections += 1
+                if private is not None:
+                    private["action"] = None
+                    private["status"] = "rejected" if outcome.requests > 0 else "missing"
+                self._push_event(
+                    {
+                        "ev": "plan_rejected",
+                        "slot": seat.slot,
+                        "alias": seat.alias,
+                        "cause": outcome.cause,
+                        "detail": outcome.detail,
+                    }
+                )
                 self._feed(
                     {},
-                    f"{seat.alias} fell back to {self.config.fallback_scripted} - {outcome.cause}",
-                    "fallback",
+                    f"{seat.alias} plan rejected - {outcome.cause}",
+                    "plan_rejected",
                 )
                 await self._send_to_slot(
                     seat.slot,
@@ -902,13 +922,10 @@ class LiveMettaGridEpisode:
                         "protocol": PLAYER_PROTOCOL,
                         "turn": self.batch.turn,
                         "step": int(self.sim.current_step),
+                        "accepted": False,
                         "station": "",
-                        "recipe": "any",
-                        "zone": "any",
-                        "handoff": "none",
-                        "yield_to": "none",
-                        "say": "",
-                        "note": "",
+                        "cause": outcome.cause,
+                        "detail": outcome.detail,
                         "src": outcome.src,
                     },
                 )
@@ -1011,7 +1028,7 @@ class LiveMettaGridEpisode:
             aliases=[seat.alias for seat in self.seats],
             seat_kinds=[seat.seat_kind for seat in self.seats],
             disconnected=[not seat.ever_connected for seat in self.seats],
-            fallbacks=[seat.fallbacks for seat in self.seats],
+            plan_rejections=[seat.plan_rejections for seat in self.seats],
             action_fallbacks=[seat.action_fallbacks for seat in self.seats],
             llm_requests=self.planner.requests if self.planner else 0,
         )

@@ -42,9 +42,11 @@ order. The plan chooses *which job, which recipe, which half of the room, who to
 yield to*; the executor chooses *which tile next*. `say` is heard by your team-mates next turn
 and shown to spectators; `note` is private and comes back only to you.
 
-The same image also ships four scripted baselines, selected with
-`PLAYER_SCRIPTED=brigade|runner|passer|courier`. Every prompt seat falls back to `brigade` when a
-plan turn produces nothing usable, so an episode always finishes.
+The same image also ships four scripted baselines, selected explicitly with
+`PLAYER_SCRIPTED=brigade|runner|passer|courier`. Prompt seats never fall back to a
+scripted baseline: a failed or missing plan turn is explicitly rejected (preserving
+the raw model reply) and the clocked kitchen advances with recorded missed turns until
+a valid plan is accepted.
 
 ## Scoring
 
