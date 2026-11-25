@@ -105,6 +105,7 @@ class CoworldGame:
         *,
         results_path: Path,
         replay_path: Path | None,
+        failure_path: Path | None = None,
         request_shutdown: Callable[[], None],
         process_start: float | None = None,
     ) -> None:
@@ -114,6 +115,7 @@ class CoworldGame:
         self.config.num_agents = len(self.tokens)
         self.results_path = results_path
         self.replay_path = replay_path
+        self.failure_path = failure_path
         env = mission_for_config(self.config)
         planner = LlmPlanner(
             model=self.config.model,
@@ -139,12 +141,17 @@ class CoworldGame:
         self.episode.configure_artifacts(
             self._write_artifacts,
             generated_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            failure_sink=self._write_failure if self.failure_path is not None else None,
         )
 
     def _write_artifacts(self, results: bytes, replay: bytes) -> None:
         self.results_path.write_bytes(results)
         if self.replay_path is not None:
             self.replay_path.write_bytes(replay)
+
+    def _write_failure(self, failure: bytes) -> None:
+        if self.failure_path is not None:
+            self.failure_path.write_bytes(failure)
 
     def global_message(self) -> dict[str, Any]:
         return {"protocol": GLOBAL_PROTOCOL, **self.episode.snapshot()}
@@ -166,10 +173,14 @@ class CoworldGame:
 def create_app(config: dict[str, Any], request_shutdown: Callable[[], None]) -> FastAPI:
     results_uri = os.environ["COGAME_RESULTS_URI"]
     replay_uri = os.environ.get("COGAME_SAVE_REPLAY_URI")
+    failure_uri = os.environ.get("COGAME_PLAYER_FAILURE_URI")
     results_path = output_path_for(results_uri, "results.json")
     replay_path = output_path_for(replay_uri, "replay.json") if replay_uri else None
+    failure_path = output_path_for(failure_uri, "player_failure.json") if failure_uri else None
 
     def finish_episode() -> None:
+        if failure_uri and failure_path and urlparse(failure_uri).scheme != "file" and failure_path.exists():
+            write_uri(failure_uri, failure_path.read_bytes(), method=os.environ.get("COGAME_PLAYER_FAILURE_METHOD"))
         if urlparse(results_uri).scheme != "file" and results_path.exists():
             write_uri(results_uri, results_path.read_bytes(), method=os.environ.get("COGAME_RESULTS_METHOD"))
         if replay_uri and replay_path and urlparse(replay_uri).scheme != "file" and replay_path.exists():
@@ -180,6 +191,7 @@ def create_app(config: dict[str, Any], request_shutdown: Callable[[], None]) -> 
         config,
         results_path=results_path,
         replay_path=replay_path,
+        failure_path=failure_path,
         request_shutdown=finish_episode,
     )
     app = FastAPI()
@@ -248,7 +260,9 @@ def create_app(config: dict[str, Any], request_shutdown: Callable[[], None]) -> 
                 if game.episode.done:
                     break
                 await game.episode.handle_player_message(connection_id, message)
-        except Exception:  # noqa: BLE001 - a dead player socket is not a game failure
+        except (json.JSONDecodeError, ValueError) as exc:
+            game.episode.fail_malformed_frame(slot, str(exc))
+        except Exception:  # noqa: BLE001 - disconnect recorded below
             pass
         finally:
             game.episode.disconnect_player(connection_id)

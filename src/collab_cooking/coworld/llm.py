@@ -25,7 +25,6 @@ from uuid import uuid4
 
 from collab_cooking.coworld.plans import (
     ERROR_RUNES,
-    RETRY_HINT,
     ParsedPlan,
     PlanError,
     parse_plan,
@@ -337,71 +336,57 @@ class LlmPlanner:
 
     # -- worker -------------------------------------------------------------
     def _one_seat(self, request: PlanRequest) -> PlanOutcome:
-        """Call, parse, retry once, else report explicit rejection. Never raises."""
+        """Issue one model request per planning turn and classify its outcome. Never raises."""
         if self._transport is None:
             return PlanOutcome(slot=request.slot, plan=None, cause="disabled")
-        used = 0
         cause = "transport"
         detail = ""
         last_raw = ""
         user = request.user
-        for attempt in (0, 1):
-            if not self.budget.take():
-                return PlanOutcome(
-                    slot=request.slot,
-                    plan=None,
-                    cause="rate_budget",
-                    detail="26 req/min",
-                    requests=used,
-                    raw_response=last_raw,
-                )
-            used += 1
-            with self._requests_lock:
-                self._requests += 1
-            receipt: dict[str, Any] = {
-                "attempt_id": str(uuid4()),
-                "policy": "prompt",
-                "origin": "model" if isinstance(self._transport, _Transport) else "unknown",
-                "inference_mode": "text_action",
-                "accepted": False,
-                "prompt": [{"role": "system", "content": request.system}, {"role": "user", "content": user}],
-            }
-            self.evidence.setdefault(request.decision_id, []).append(receipt)
-            started = time.monotonic()
+        with self._requests_lock:
+            self._requests += 1
+        receipt: dict[str, Any] = {
+            "attempt_id": str(uuid4()),
+            "policy": "prompt",
+            "origin": "model" if isinstance(self._transport, _Transport) else "unknown",
+            "inference_mode": "text_action",
+            "accepted": False,
+            "prompt": [{"role": "system", "content": request.system}, {"role": "user", "content": user}],
+        }
+        self.evidence.setdefault(request.decision_id, []).append(receipt)
+        started = time.monotonic()
+        try:
+            text = self._transport.complete(request.system, user, self.max_output_tokens, request.slot)
+        except Exception as exc:  # noqa: BLE001 - classified, never escapes
+            message = f"{exc}"
+            cause = "timeout" if "timed out" in message.lower() or "timeout" in message.lower() else "transport"
+            detail = truncate_runes(message, ERROR_RUNES)
+            _log(f"slot {request.slot}: {cause} {detail}")
+        else:
+            receipt["response"] = text
+            last_raw = text
             try:
-                text = self._transport.complete(request.system, user, self.max_output_tokens, request.slot)
-            except Exception as exc:  # noqa: BLE001 - classified, never escapes
-                message = f"{exc}"
-                cause = "timeout" if "timed out" in message.lower() or "timeout" in message.lower() else "transport"
-                detail = truncate_runes(message, ERROR_RUNES)
-                _log(f"slot {request.slot} attempt {attempt}: {cause} {detail}")
+                plan = parse_plan(text, request.legal_stations, request.ally_aliases)
+            except PlanError as exc:
+                cause, detail = exc.cause, exc.detail
+                _log(f"slot {request.slot}: {cause} {detail}")
             else:
-                receipt["response"] = text
-                last_raw = text
-                try:
-                    plan = parse_plan(text, request.legal_stations, request.ally_aliases)
-                except PlanError as exc:
-                    cause, detail = exc.cause, exc.detail
-                    _log(f"slot {request.slot} attempt {attempt}: {cause} {detail}")
-                else:
-                    receipt["parsed_action"] = {key: getattr(plan, key) for key in plan.__dataclass_fields__}
-                    receipt["accepted"] = True
-                    return PlanOutcome(slot=request.slot, plan=plan, requests=used, raw_response=text)
-            finally:
-                receipt["latency_ms"] = (time.monotonic() - started) * 1000
-                if isinstance(self._transport, _Transport):
-                    receipt.update(getattr(self._transport.local, "evidence", {}))
-                if not receipt["accepted"]:
-                    receipt["rejection_reason"] = f"{cause}: {detail}"
+                receipt["parsed_action"] = {key: getattr(plan, key) for key in plan.__dataclass_fields__}
+                receipt["accepted"] = True
+                return PlanOutcome(slot=request.slot, plan=plan, requests=1, raw_response=text)
+        finally:
+            receipt["latency_ms"] = (time.monotonic() - started) * 1000
+            if isinstance(self._transport, _Transport):
+                receipt.update(getattr(self._transport.local, "evidence", {}))
+            if not receipt["accepted"]:
+                receipt["rejection_reason"] = f"{cause}: {detail}"
 
-            if attempt == 0:
-                user = f"{request.user}\n\n{RETRY_HINT}"
         return PlanOutcome(
             slot=request.slot,
             plan=None,
             cause=cause,
             detail=detail,
-            requests=used,
+            requests=1,
             raw_response=last_raw,
         )
 
