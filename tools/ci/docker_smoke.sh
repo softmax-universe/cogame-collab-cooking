@@ -66,7 +66,9 @@ network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
 
+fixture_pid=""
 cleanup() {
+  if [ -n "${fixture_pid}" ]; then kill "${fixture_pid}" 2>/dev/null || true; fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,11 +193,19 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(--add-host host.docker.internal:host-gateway -e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  echo "COWORLD_LLM_ENDPOINT present: using configured endpoint"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
   echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  python3 "${repo_dir}/tools/ci/model_fixture.py" "${work_dir}/fixture.port" >"${work_dir}/fixture.log" 2>&1 &
+  fixture_pid=$!
+  for _ in $(seq 1 100); do [ -s "${work_dir}/fixture.port" ] && break; sleep 0.1; done
+  fixture_port="$(cat "${work_dir}/fixture.port")"
+  game_env+=(--add-host host.docker.internal:host-gateway -e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${fixture_port}" -e "COWORLD_LLM_MODEL=fixture/collab_cooking")
+  echo "started deterministic local HTTP model fixture on port ${fixture_port}"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."

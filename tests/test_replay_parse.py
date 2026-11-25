@@ -44,7 +44,7 @@ def artifacts(tmp_path_factory) -> dict:
             "station": "chop",
             "recipe": "soup",
             "zone": "left",
-            "handoff": "Cog-B",
+            "handoff": "none",
             "yield_to": "none",
             "say": MULTIBYTE_SAY,
             "note": "\u2603" * 400,

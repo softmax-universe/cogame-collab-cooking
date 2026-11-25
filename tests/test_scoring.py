@@ -113,13 +113,23 @@ def test_cross_play_is_true_when_an_external_or_prompt_policy_sits_with_scripted
 
 
 def test_a_real_episode_reports_cross_play_and_its_seat_kinds() -> None:
+    from collab_cooking.coworld.llm import LlmPlanner
+    from tests.test_llm import StubTransport
+
+    planner = LlmPlanner(
+        transport=StubTransport(['{"station":"chop","recipe":"soup","say":"chopping"}']),
+        max_workers=1,
+        timeout_seconds=5,
+    )
     out = run_episode(
         fast_cert_config(max_steps=120, step_seconds=0.0, shutdown_grace_seconds=0.0,
                          player_connect_timeout_seconds=2),
         [prompt_registration(), scripted_registration("brigade"),
          scripted_registration("passer"), scripted_registration("courier")],
         Path(tempfile.mkdtemp()),
+        planner=planner,
     )
+    planner.shutdown()
     results = out["results"]
     assert results["seat_kinds"] == [
         "prompt", "scripted:brigade", "scripted:passer", "scripted:courier"

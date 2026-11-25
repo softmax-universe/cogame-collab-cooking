@@ -12,7 +12,7 @@ from coworld.decision_trajectory import DecisionAttempt, DecisionEvent, EpisodeE
 from collab_cooking.coworld.server import write_uri
 
 
-def write_capture(episode, results: dict) -> None:
+def write_capture(episode, results: dict[str, Any] | None, *, failure: dict[str, Any] | None = None) -> None:
     destination = os.environ.get("COGAME_SAVE_TRAJECTORY_URI")
     if not destination:
         return
@@ -62,17 +62,29 @@ def write_capture(episode, results: dict) -> None:
                 fallback_origin=None,
             )
         )
-    pending = episode.batch is not None and any(not future.done() for future in episode.batch.futures.values())
-    status = "completed" if results["reason"] == "complete" and not pending else "truncated"
-    events.append(
-        EpisodeEvent(
-            **identity,
-            seed_family=f"{episode.config.layout}-{episode.config.seed}",
-            status=status,
-            outcome=results,
-            participant_outcomes=results["scores"],
+    if failure is not None:
+        events.append(
+            EpisodeEvent(
+                **identity,
+                seed_family=f"{episode.config.layout}-{episode.config.seed}",
+                status="failed",
+                outcome=failure,
+                participant_outcomes=None,
+            )
         )
-    )
+    else:
+        assert results is not None
+        pending = episode.batch is not None and any(not future.done() for future in episode.batch.futures.values())
+        status = "completed" if results["reason"] == "complete" and not pending else "truncated"
+        events.append(
+            EpisodeEvent(
+                **identity,
+                seed_family=f"{episode.config.layout}-{episode.config.seed}",
+                status=status,
+                outcome=results,
+                participant_outcomes=results["scores"],
+            )
+        )
     body = "".join(event.model_dump_json() + "\n" for event in events).encode()
     if destination == os.environ.get("COGAME_SAVE_REPLAY_URI"):
         raise ValueError("private trajectory must have a separate destination from public replay")

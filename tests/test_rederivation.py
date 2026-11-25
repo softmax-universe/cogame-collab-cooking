@@ -40,6 +40,14 @@ BLOCKED_BIT = 1
 @pytest.fixture(scope="module")
 def document(tmp_path_factory) -> dict:
     """One real episode, read back as the bytes the viewer would be served."""
+    from collab_cooking.coworld.llm import LlmPlanner
+    from tests.test_llm import StubTransport
+
+    planner = LlmPlanner(
+        transport=StubTransport(['{"station":"chop","recipe":"soup","say":"chopping"}']),
+        max_workers=1,
+        timeout_seconds=5,
+    )
     out = run_episode(
         fast_cert_config(
             max_steps=240,
@@ -49,9 +57,9 @@ def document(tmp_path_factory) -> dict:
             plan_interval_steps=60,
             min_plan_interval_seconds=0.0,
         ),
-        # A prompt seat with no credentials contributes `fallback` events: the
-        # replay carries events the sim cannot produce as well as those it can,
-        # and the re-derivation has to keep them apart.
+        # A prompt seat contributes `plan` events: the replay carries events
+        # the sim cannot produce as well as those it can, and the re-derivation
+        # has to keep them apart.
         [
             prompt_registration("Keep the pot busy."),
             scripted_registration("brigade"),
@@ -59,7 +67,9 @@ def document(tmp_path_factory) -> dict:
             scripted_registration("courier"),
         ],
         Path(tmp_path_factory.mktemp("rederive")),
+        planner=planner,
     )
+    planner.shutdown()
     return json.loads(out["replay_bytes"].decode("utf-8"))
 
 

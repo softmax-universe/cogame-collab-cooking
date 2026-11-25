@@ -165,32 +165,22 @@ def test_one_parallel_batch_issues_every_seat_at_once() -> None:
     assert len(transport.calls) == 4
 
 
-def test_an_illegal_station_triggers_exactly_one_retry_then_rejection_preserving_raw() -> None:
-    transport = StubTransport(['{"station":"pot"}', '{"station":"pot"}', '{"station":"pot"}'])
+def test_an_illegal_station_is_rejected_in_one_request_preserving_raw() -> None:
+    transport = StubTransport(['{"station":"pot"}', '{"station":"chop"}'])
     planner = LlmPlanner(transport=transport, max_workers=1, timeout_seconds=5)
     req = request(0)
     batch = planner.start_turn(1, [req])
     outcomes = drain(planner, batch)
     planner.shutdown()
-    assert len(transport.calls) == 2, "one call, one retry, then give up"
-    assert "rejected" in transport.calls[1][1], "the retry carries the hint"
+    assert len(transport.calls) == 1, "exactly one request per model planning turn (no hidden retry)"
     outcome = outcomes[0]
     assert not outcome.ok and outcome.cause == "illegal_station"
     assert outcome.src == "rejected:illegal_station"
     assert outcome.raw_response == '{"station":"pot"}'
     attempts = planner.evidence[req.decision_id]
-    assert len(attempts) == 2
-    assert all(not a["accepted"] and a["response"] == '{"station":"pot"}' for a in attempts)
-    assert all("illegal_station" in a["rejection_reason"] for a in attempts)
-
-
-def test_a_retry_that_succeeds_is_used() -> None:
-    transport = StubTransport(["not json", '{"station":"sink"}'])
-    planner = LlmPlanner(transport=transport, max_workers=1, timeout_seconds=5)
-    outcomes = drain(planner, planner.start_turn(1, [request(0)]))
-    planner.shutdown()
-    assert outcomes[0].ok and outcomes[0].plan.station == "sink"
-    assert outcomes[0].requests == 2
+    assert len(attempts) == 1
+    assert not attempts[0]["accepted"] and attempts[0]["response"] == '{"station":"pot"}'
+    assert "illegal_station" in attempts[0]["rejection_reason"]
 
 
 def test_a_transport_exception_never_escapes_the_batch() -> None:
@@ -198,6 +188,7 @@ def test_a_transport_exception_never_escapes_the_batch() -> None:
     planner = LlmPlanner(transport=transport, max_workers=1, timeout_seconds=5)
     outcomes = drain(planner, planner.start_turn(1, [request(0)]))
     planner.shutdown()
+    assert len(transport.calls) == 1
     assert not outcomes[0].ok and outcomes[0].cause == "transport"
     assert "connection reset" in outcomes[0].detail
 
@@ -210,15 +201,15 @@ def test_the_rolling_budget_refuses_the_call_that_would_exceed_it() -> None:
     assert budget.spent == 3
 
 
-def test_a_seat_that_cannot_be_called_falls_back_with_rate_budget() -> None:
+def test_planner_does_not_apply_artificial_rate_gate() -> None:
     transport = StubTransport(['{"station":"chop"}'])
     planner = LlmPlanner(transport=transport, max_workers=1, max_requests_per_minute=1, timeout_seconds=5)
     first = drain(planner, planner.start_turn(1, [request(0)]))
     assert first[0].ok
     second = drain(planner, planner.start_turn(2, [request(0)]))
     planner.shutdown()
-    assert not second[0].ok and second[0].cause == "rate_budget"
-    assert len(transport.calls) == 1, "the refused call was never made"
+    assert second[0].ok
+    assert len(transport.calls) == 2, "no artificial requests-per-minute rate gate"
 
 
 # -- disabled --------------------------------------------------------------

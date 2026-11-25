@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import random
 import time
 from collections.abc import Callable, Mapping
@@ -39,7 +40,7 @@ from pydantic import BaseModel, Field
 
 from collab_cooking.agent.brain.entity_map import EntityMap, _is_within_obs_shape
 from collab_cooking.agent.brain.obs_parser import ObsParser
-from collab_cooking.agent.brain.policy import BASELINE_NAMES, DEFAULT_BASELINE
+from collab_cooking.agent.brain.policy import BASELINE_NAMES
 from collab_cooking.coworld import replay as replay_mod
 from collab_cooking.coworld import results as results_mod
 from collab_cooking.coworld.llm import (
@@ -70,6 +71,7 @@ ALIASES: tuple[str, ...] = ("Cog-A", "Cog-B", "Cog-C", "Cog-D")
 REGISTER_GRACE_SECONDS = 5.0
 FEED_LINES = 8
 RADIO_LINES = 3
+INCONCLUSIVE_PLAN_CAUSES = frozenset({"disabled", "transport", "timeout", "rate_budget"})
 
 
 class PlayerWebSocket(Protocol):
@@ -165,7 +167,7 @@ class EpisodeConfig:
     policy_action_timeout_seconds: float = 0.30
     player_connect_timeout_seconds: float = 120.0
     plan_interval_steps: int = 50
-    min_plan_interval_seconds: float = 10.0
+    min_plan_interval_seconds: float = 0.0
     plan_timeout_seconds: float = 12.0
     llm_max_requests_per_minute: int = 26
     play_budget_fraction: float = 0.6
@@ -277,6 +279,9 @@ class LiveMettaGridEpisode:
 
         self.play_task: asyncio.Task[None] | None = None
         self.done = False
+        self.failed = False
+        self.failure: dict[str, Any] | None = None
+        self._pending_failure: tuple[int, str, str] | None = None
         self.exited = False
         self.paused = False
         self.reason = ""
@@ -308,6 +313,7 @@ class LiveMettaGridEpisode:
 
         self.writer: replay_mod.ReplayWriter | None = None
         self._artifact_sink: Callable[[bytes, bytes], None] | None = None
+        self._failure_sink: Callable[[bytes], None] | None = None
         self._pending_events: list[dict[str, Any]] = []
 
     # -- wiring -------------------------------------------------------------
@@ -339,8 +345,15 @@ class LiveMettaGridEpisode:
             request_shutdown=request_shutdown,
         )
 
-    def configure_artifacts(self, sink: Callable[[bytes, bytes], None], *, generated_at: str) -> None:
+    def configure_artifacts(
+        self,
+        sink: Callable[[bytes, bytes], None],
+        *,
+        generated_at: str,
+        failure_sink: Callable[[bytes], None] | None = None,
+    ) -> None:
         self._artifact_sink = sink
+        self._failure_sink = failure_sink
         config = self.config.as_dict()
         self.writer = replay_mod.ReplayWriter(
             layout=self.config.layout,
@@ -373,6 +386,16 @@ class LiveMettaGridEpisode:
         seat.ever_connected = True
         return connection_id
 
+    def _record_pending_failure(self, slot: int, kind: str, message: str) -> None:
+        if self._pending_failure is None and not self.done:
+            self._pending_failure = (slot, kind, message)
+            self._policy_action_event.set()
+
+    def fail_malformed_frame(self, slot: int, detail: str) -> None:
+        if 0 <= slot < len(self.seats):
+            self.seats[slot].action_fallbacks["malformed_frame"] += 1
+            self._record_pending_failure(slot, "player_error", f"seat {slot} sent malformed frame: {detail}")
+
     def disconnect_player(self, connection_id: str) -> None:
         connection = self.connections.pop(connection_id, None)
         if connection is None:
@@ -380,6 +403,12 @@ class LiveMettaGridEpisode:
         self.connections_by_slot[connection.slot].pop(connection_id, None)
         if not self.connections_by_slot[connection.slot]:
             self.seats[connection.slot].connected = False
+            if not self.done:
+                self._record_pending_failure(
+                    connection.slot,
+                    "episode_inconclusive",
+                    f"seat {connection.slot} disconnected at step {int(self.sim.current_step)}",
+                )
         self._policy_action_event.set()
 
     def connected_slots(self) -> set[int]:
@@ -391,8 +420,8 @@ class LiveMettaGridEpisode:
             return
         try:
             message = PlayerClientMessage.model_validate(raw_message)
-        except Exception:  # noqa: BLE001 - a malformed frame is never a disconnect
-            self.seats[connection.slot].action_fallbacks["malformed_frame"] += 1
+        except Exception as exc:  # noqa: BLE001 - classified as player_error
+            self.fail_malformed_frame(connection.slot, str(exc))
             return
         seat = self.seats[connection.slot]
         if message.type == "register":
@@ -406,8 +435,8 @@ class LiveMettaGridEpisode:
 
     def _register(self, seat: Seat, message: PlayerClientMessage) -> None:
         """Accept explicit `prompt`, `scripted` (with valid baseline), or `external`
-        registration. Unknown kinds or baselines are rejected as malformed frames
-        without silently substituting a scripted baseline."""
+        registration. Unknown kinds or baselines fail the episode without silently
+        substituting a scripted baseline."""
         kind = (message.kind or "").strip().lower()
         if kind == "prompt":
             seat.registered = True
@@ -427,19 +456,45 @@ class LiveMettaGridEpisode:
                 seat.kind = "scripted"
                 seat.baseline = baseline
                 return
-        seat.action_fallbacks["malformed_frame"] += 1
+        self.fail_malformed_frame(seat.slot, f"invalid registration kind={kind!r} baseline={message.baseline!r}")
 
     # -- the loop -----------------------------------------------------------
     async def run(self) -> None:
         await self._wait_for_roster()
-        if not self.connected_slots():
-            await self._settle("no_players")
+        if self._pending_failure is not None:
+            await self._fail_episode(*self._pending_failure)
+            return
+        if len(self.connected_slots()) < len(self.tokens):
+            missing = next(slot for slot in range(len(self.tokens)) if not self.connections_by_slot[slot])
+            await self._fail_episode(
+                missing,
+                "episode_inconclusive",
+                f"seat {missing} did not connect before roster timeout",
+            )
             return
         await self._wait_for_registrations()
-        self._push_event({"ev": "episode_start", "layout": self.config.layout})
+        if self._pending_failure is not None:
+            await self._fail_episode(*self._pending_failure)
+            return
+        unregistered = [seat.slot for seat in self.seats if not seat.registered]
+        if unregistered:
+            slot = unregistered[0]
+            await self._fail_episode(
+                slot,
+                "episode_inconclusive",
+                f"seat {slot} did not register before registration timeout",
+            )
+            return
         self.state = replay_mod.capture(self.sim, len(self.tokens))
+        self._update_prompt_memory()
+        if not await self._run_initial_plan_turn():
+            return
+        self._push_event({"ev": "episode_start", "layout": self.config.layout})
         await self._send_observations()
         while self.sim.current_step < self.config.max_steps and not self.sim.is_done():
+            if self._pending_failure is not None:
+                await self._fail_episode(*self._pending_failure)
+                return
             if self.paused:
                 # The guard is NOT paused. `pause` is a spectator control that
                 # anything reaching WS /global can send, and a paused loop
@@ -454,7 +509,11 @@ class LiveMettaGridEpisode:
             tick_started = time.monotonic()
 
             await self._wait_for_policy_actions(step)
-            self._apply_actions(step)  # 1 + 2
+            if self._pending_failure is not None:
+                await self._fail_episode(*self._pending_failure)
+                return
+            if not await self._apply_actions(step):  # 1 + 2
+                return
             self.sim.step()  # 3
             current = replay_mod.capture(self.sim, len(self.tokens))  # 4
             events = replay_mod.derive_events(  # 5
@@ -464,8 +523,14 @@ class LiveMettaGridEpisode:
             self._record(current, events)  # 6
             self.state = current
             self._update_prompt_memory()
-            self._plan_boundary(step)  # 7
-            await self._deliver_plans()  # 8
+            if step > 0 and self.sim.current_step < self.config.max_steps:
+                if not await self._plan_boundary(step):  # 7
+                    return
+            if not await self._deliver_plans():  # 8
+                return
+            if self._pending_failure is not None:
+                await self._fail_episode(*self._pending_failure)
+                return
             if self.sim.current_step < self.config.max_steps and not self.sim.is_done():
                 await self._send_observations()  # 9
             elapsed = time.monotonic() - tick_started
@@ -484,13 +549,15 @@ class LiveMettaGridEpisode:
         """Bounded. Start the moment everyone is here, else at the deadline."""
         deadline = self.process_start + self.config.player_connect_timeout_seconds
         while len(self.connected_slots()) < len(self.tokens):
-            if time.monotonic() >= deadline or self._deadline_reached():
+            if self._pending_failure is not None or time.monotonic() >= deadline or self._deadline_reached():
                 return
             await asyncio.sleep(0.05)
 
     async def _wait_for_registrations(self) -> None:
         deadline = time.monotonic() + REGISTER_GRACE_SECONDS
         while time.monotonic() < deadline:
+            if self._pending_failure is not None:
+                break
             if all(self.seats[slot].registered for slot in self.connected_slots()):
                 break
             await asyncio.sleep(0.02)
@@ -512,34 +579,43 @@ class LiveMettaGridEpisode:
                 return
 
     def _policy_actions_ready(self, step: int) -> bool:
+        if self._pending_failure is not None:
+            return True
         expected = f"step-{step}"
         return all(
             not self.connections_by_slot[slot]
-            or (self.seats[slot].kind == "prompt" and not self.seats[slot].has_active_plan)
             or self.latest_policy_actions[slot].request_id == expected
             for slot in range(len(self.tokens))
         )
 
-    def _apply_actions(self, step: int) -> None:
+    async def _apply_actions(self, step: int) -> bool:
         expected = f"step-{step}"
         for slot in range(len(self.tokens)):
             action = self.latest_policy_actions[slot]
-            cause = (
-                "disconnected"
-                if not self.connections_by_slot[slot]
-                else "deadline"
-                if action.request_id != expected
-                else "invalid_action"
-                if not action.valid
-                else ""
-            )
-            if cause:
-                self.seats[slot].action_fallbacks[cause] += 1
-                self._push_event({"ev": "action_fallback", "slot": slot, "step": step, "cause": cause})
-                action = self._noop_action
+            if not self.connections_by_slot[slot]:
+                self.seats[slot].action_fallbacks["disconnected"] += 1
+                await self._fail_episode(slot, "episode_inconclusive", f"seat {slot} disconnected at step {step}")
+                return False
+            if action.request_id != expected:
+                self.seats[slot].action_fallbacks["deadline"] += 1
+                await self._fail_episode(
+                    slot,
+                    "player_error",
+                    f"seat {slot} missed action deadline at step {step} (got request_id={action.request_id!r})",
+                )
+                return False
+            if not action.valid:
+                self.seats[slot].action_fallbacks["invalid_action"] += 1
+                await self._fail_episode(
+                    slot,
+                    "player_error",
+                    f"seat {slot} submitted illegal action at step {step}",
+                )
+                return False
             self.latest_action_indices[slot] = action.action_index
             self.applied_actions[slot] = action.action_name
             self.sim.agent(slot).set_action(action.action_name)
+        return True
 
     def _record(self, current: replay_mod.TickState, events: list[dict[str, Any]]) -> None:
         if self.writer is None:
@@ -631,24 +707,10 @@ class LiveMettaGridEpisode:
     def _prompt_seats(self) -> list[Seat]:
         return [seat for seat in self.seats if seat.kind == "prompt" and seat.connected]
 
-    def _plan_boundary(self, step: int) -> None:
-        if self.planner is None or self.planner.disabled:
-            self._reject_all("disabled", step)
-            return
-        if step % self.config.plan_interval_steps != 0:
-            return
-        if self.batch is not None and (
-            not self.batch.finished or any(not future.done() for future in self.batch.futures.values())
-        ):
-            return
-        now = time.monotonic()
-        if self.last_batch_at and now - self.last_batch_at < self.config.min_plan_interval_seconds:
-            return
-        seats = self._prompt_seats()
-        if not seats:
-            return
+    def _start_plan_turn(self, seats: list[Seat]) -> None:
+        assert self.planner is not None
         self.turn += 1
-        self.last_batch_at = now
+        self.last_batch_at = time.monotonic()
         requests = [self._plan_request(seat) for seat in seats]
         for request in requests:
             self._private_plans.append(
@@ -663,16 +725,53 @@ class LiveMettaGridEpisode:
             seat.plan_pending = True
         self.batch = self.planner.start_turn(self.turn, requests)
 
-    def _reject_all(self, cause: str, step: int) -> None:
-        """No LLM transport configured: record missed/rejected plan turns with no baseline fallback."""
-        if step % self.config.plan_interval_steps != 0:
-            return
+    async def _run_initial_plan_turn(self) -> bool:
+        """Obtain the first actual model plan for every prompt seat before tick 0."""
         seats = self._prompt_seats()
         if not seats:
-            return
+            return True
+        if self.planner is None or self.planner.disabled:
+            await self._fail_missing_transport(seats)
+            return False
+        self._start_plan_turn(seats)
+        while self.batch is not None and not self.batch.finished:
+            if self._pending_failure is not None:
+                await self._fail_episode(*self._pending_failure)
+                return False
+            if not await self._deliver_plans():
+                return False
+            if self.batch.finished:
+                break
+            if self._deadline_reached():
+                pending_slot = next(
+                    (seat.slot for seat in seats if not seat.has_active_plan),
+                    seats[0].slot,
+                )
+                await self._fail_episode(
+                    pending_slot,
+                    "episode_inconclusive",
+                    f"seat {pending_slot} initial plan timed out at episode deadline",
+                )
+                return False
+            await asyncio.sleep(0.01)
+        if not await self._deliver_plans():
+            return False
+        for seat in seats:
+            if not seat.has_active_plan:
+                await self._fail_episode(
+                    seat.slot,
+                    "episode_inconclusive",
+                    f"seat {seat.slot} did not obtain an initial model plan before tick 0",
+                )
+                return False
+        return True
+
+    async def _fail_missing_transport(self, seats: list[Seat]) -> None:
+        """Record missing plans in the private trace and fail unscored."""
         self.turn += 1
         for seat in seats:
             seat.has_active_plan = False
+            seat.plan_rejections += 1
             self._private_plans.append(
                 {
                     "request": self._plan_request(seat),
@@ -681,8 +780,31 @@ class LiveMettaGridEpisode:
                     "status": "missing",
                 }
             )
-            seat.plan_rejections += 1
-            self._push_event({"ev": "plan_rejected", "slot": seat.slot, "alias": seat.alias, "cause": cause})
+        await self._fail_episode(
+            seats[0].slot,
+            "episode_inconclusive",
+            f"seat {seats[0].slot} plan failed: disabled (no LLM transport configured)",
+        )
+
+    async def _plan_boundary(self, step: int) -> bool:
+        if step % self.config.plan_interval_steps != 0:
+            return True
+        seats = self._prompt_seats()
+        if not seats:
+            return True
+        if self.planner is None or self.planner.disabled:
+            await self._fail_missing_transport(seats)
+            return False
+        if self.batch is not None and (
+            not self.batch.finished or any(not future.done() for future in self.batch.futures.values())
+        ):
+            return True
+        now = time.monotonic()
+        if self.config.min_plan_interval_seconds > 0 and self.last_batch_at:
+            if now - self.last_batch_at < self.config.min_plan_interval_seconds:
+                return True
+        self._start_plan_turn(seats)
+        return True
 
     def _plan_request(self, seat: Seat) -> PlanRequest:
         view = self._seat_view(seat)
@@ -846,9 +968,9 @@ class LiveMettaGridEpisode:
             seat.seen_step,
         )
 
-    async def _deliver_plans(self) -> None:
+    async def _deliver_plans(self) -> bool:
         if self.batch is None:
-            return
+            return True
         for outcome in self.batch.poll():
             seat = self.seats[outcome.slot]
             seat.plan_pending = False
@@ -901,34 +1023,17 @@ class LiveMettaGridEpisode:
                 if private is not None:
                     private["action"] = None
                     private["status"] = "rejected" if outcome.requests > 0 else "missing"
-                self._push_event(
-                    {
-                        "ev": "plan_rejected",
-                        "slot": seat.slot,
-                        "alias": seat.alias,
-                        "cause": outcome.cause,
-                        "detail": outcome.detail,
-                    }
+                failure_kind = (
+                    "episode_inconclusive" if outcome.cause in INCONCLUSIVE_PLAN_CAUSES else "player_error"
                 )
-                self._feed(
-                    {},
-                    f"{seat.alias} plan rejected - {outcome.cause}",
-                    "plan_rejected",
-                )
-                await self._send_to_slot(
+                detail = f": {outcome.detail}" if outcome.detail else ""
+                await self._fail_episode(
                     seat.slot,
-                    {
-                        "type": "plan",
-                        "protocol": PLAYER_PROTOCOL,
-                        "turn": self.batch.turn,
-                        "step": int(self.sim.current_step),
-                        "accepted": False,
-                        "station": "",
-                        "cause": outcome.cause,
-                        "detail": outcome.detail,
-                        "src": outcome.src,
-                    },
+                    failure_kind,
+                    f"seat {seat.slot} ({seat.alias}) plan failed ({outcome.cause}){detail}",
                 )
+                return False
+        return True
 
     # -- messages -----------------------------------------------------------
     async def _send_observations(self) -> None:
@@ -1032,6 +1137,42 @@ class LiveMettaGridEpisode:
             action_fallbacks=[seat.action_fallbacks for seat in self.seats],
             llm_requests=self.planner.requests if self.planner else 0,
         )
+
+    async def _fail_episode(self, slot: int, kind: str, message: str) -> None:
+        if self.done:
+            return
+        self.done = True
+        self.failed = True
+        self.reason = kind
+        self.failure = {
+            "failed_policy_index": int(slot),
+            "kind": kind,
+            "message": truncate_runes(message, 2000) or f"seat {slot} failed ({kind})",
+        }
+        if self.planner is not None and self.batch is not None:
+            pending = [asyncio.wrap_future(future) for future in self.batch.futures.values() if not future.done()]
+            if pending:
+                await asyncio.wait(pending, timeout=min(2.0, self.config.plan_timeout_seconds))
+        from collab_cooking.coworld.capture import write_capture
+
+        write_capture(self, None, failure=self.failure)
+        if self._failure_sink is not None:
+            self._failure_sink(json.dumps(self.failure, ensure_ascii=False).encode("utf-8"))
+        await self._send_to_players(
+            {
+                connection_id: {
+                    "type": "final",
+                    "done": True,
+                    "reason": kind,
+                    "failure": self.failure,
+                }
+                for connection_id in list(self.connections)
+            }
+        )
+        if self.planner is not None:
+            self.planner.shutdown()
+        self.exited = True
+        self.request_shutdown()
 
     async def _settle(self, reason: str) -> None:
         self.reason = reason
