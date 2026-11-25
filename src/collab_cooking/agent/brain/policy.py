@@ -86,7 +86,7 @@ class PlanDirective:
     handoff: str = "none"
     yield_to: str = "none"
     say: str = ""
-    src: str = "fallback:none"
+    src: str = "llm"
 
 
 @dataclass
@@ -122,10 +122,14 @@ class KitchenBrain(StatefulPolicyImpl[KitchenAgentState]):
         *,
         layout: str = "open-kitchen",
         baseline: str = DEFAULT_BASELINE,
+        require_plan: bool = False,
     ) -> None:
         self._agent_id = agent_id
         self._num_agents = pei.num_agents
         self._layout = layout
+        self._require_plan = require_plan
+        if not require_plan and baseline not in BASELINE_NAMES:
+            raise ValueError(f"unknown baseline {baseline!r}; expected one of {BASELINE_NAMES}")
         self._baseline = baseline if baseline in BASELINE_NAMES else DEFAULT_BASELINE
         self._role = _baseline_role(self._baseline, agent_id, pei.num_agents)
         self._talk_enabled = pei.talk.enabled
@@ -197,11 +201,35 @@ class KitchenBrain(StatefulPolicyImpl[KitchenAgentState]):
             src=plan.src,
         )
 
+    def observe_only(
+        self,
+        obs: AgentObservation,
+        state: KitchenAgentState,
+    ) -> KitchenAgentState:
+        """Update remembered world state without choosing or synthesizing an action."""
+        state.step += 1
+        state.current_task = ""
+        parsed, visible = self._obs_parser.parse(obs, fallback_position=state.position)
+        state.position = parsed.position
+        state.inventory = parsed.inventory
+        state.entity_map.update_from_observation(
+            state.position,
+            self._obs_parser.obs_half_h,
+            self._obs_parser.obs_half_w,
+            visible,
+            state.step,
+        )
+        state.last_pos = state.position
+        state.last_inventory_key = _held_item_resource(state.inventory) or ""
+        return state
+
     def step_with_state(
         self,
         obs: AgentObservation,
         state: KitchenAgentState,
     ) -> tuple[Action, KitchenAgentState]:
+        if self._require_plan and state.plan is None:
+            raise RuntimeError("prompt seat has no active plan; scripted baseline fallback is disabled")
         state.step += 1
         state.current_task = ""
 

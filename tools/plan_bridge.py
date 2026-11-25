@@ -37,10 +37,16 @@ class PlanBridge:
         episode = self.episode
         while episode.sim.current_step < self.config.max_steps and not episode.sim.is_done():
             step = int(episode.sim.current_step)
-            actions = [
-                player.act(episode.observation_message(slot)["observation"])[0]
-                for slot, player in enumerate(self.players)
-            ]
+            if step % self.config.plan_interval_steps == 0 and (episode.turn == 0 or step > self._last_plan_step):
+                self._last_plan_step = step
+                episode.turn += 1
+                self.requests = [episode._plan_request(seat) for seat in episode.seats]
+                self.views = [episode._seat_view(seat) for seat in episode.seats]
+                return self.observation()
+            actions = []
+            for slot, player in enumerate(self.players):
+                decision = player.act(episode.observation_message(slot)["observation"])
+                actions.append(decision[0] if decision is not None else "noop")
             for slot, action in enumerate(actions):
                 episode.sim.agent(slot).set_action(action)
             episode.sim.step()
@@ -51,11 +57,6 @@ class PlanBridge:
             episode._absorb(events)
             episode.state = current
             episode._update_prompt_memory()
-            if step % self.config.plan_interval_steps == 0:
-                episode.turn += 1
-                self.requests = [episode._plan_request(seat) for seat in episode.seats]
-                self.views = [episode._seat_view(seat) for seat in episode.seats]
-                return self.observation()
         return {
             "kind": "terminal",
             "scores": {str(slot): score for slot, score in enumerate(seat_scores(episode.delivered()))},
@@ -117,11 +118,14 @@ class PlanBridge:
                     seat.kind = "prompt"
                     seat.connected = seat.ever_connected = seat.registered = True
                     player = PlayerSeat()
-                    player.configure(self.episode.player_config_message(slot, f"training-{slot}"), "brigade")
+                    player.configure(
+                        self.episode.player_config_message(slot, f"training-{slot}"), "brigade", kind="prompt"
+                    )
                     self.players.append(player)
                 self.episode.state = replay.capture(self.episode.sim, 4)
                 self.decision_id = 0
                 self.pending = []
+                self._last_plan_step = -1
                 return self.advance()
             case "teacher":
                 # A deterministic legal-plan fixture, not an expert teacher.

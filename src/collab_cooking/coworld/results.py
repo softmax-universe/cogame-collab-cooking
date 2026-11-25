@@ -52,7 +52,7 @@ def build_results(
     aliases: list[str],
     seat_kinds: list[str],
     disconnected: list[bool],
-    fallbacks: list[int],
+    plan_rejections: list[int],
     action_fallbacks: list[dict[str, int]],
     llm_requests: int,
 ) -> dict[str, Any]:
@@ -85,7 +85,7 @@ def build_results(
         "seat_kinds": list(seat_kinds),
         "cross_play": bool(policy_seated and scripted_seated),
         "disconnected": [bool(v) for v in disconnected],
-        "fallbacks": [int(v) for v in fallbacks],
+        "plan_rejections": [int(v) for v in plan_rejections],
         "action_fallbacks": [dict(counts) for counts in action_fallbacks],
         "llm_requests": int(llm_requests),
     }

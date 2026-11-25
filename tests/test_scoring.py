@@ -33,7 +33,7 @@ def sample(**overrides) -> dict:
         aliases=["Cog-A", "Cog-B", "Cog-C", "Cog-D"],
         seat_kinds=["prompt", "prompt", "scripted:brigade", "scripted:passer"],
         disconnected=[False, False, False, False],
-        fallbacks=[0, 1, 0, 0],
+        plan_rejections=[0, 1, 0, 0],
         llm_requests=68,
         action_fallbacks=[dict(invalid_action=0, deadline=0, disconnected=0, malformed_frame=0) for _ in range(4)],
     )
@@ -92,7 +92,7 @@ def test_scores_never_decrease_over_an_episode() -> None:
 def test_results_shape() -> None:
     results = sample()
     for key in ("scores", "delivered", "names", "aliases", "seat_kinds", "disconnected",
-                "fallbacks", "blocked_moves", "handoffs"):
+                "plan_rejections", "blocked_moves", "handoffs"):
         assert len(results[key]) == 4, key
     assert results["reason"] in LEGAL_REASONS
     assert set(results["served_by_recipe"]) == {"salad", "soup", "fries"}

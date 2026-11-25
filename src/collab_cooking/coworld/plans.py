@@ -1,8 +1,9 @@
 """The plan reply schema, its caps, and rune-boundary truncation.
 
-One JSON object per seat per plan turn. Unknown keys are ignored; extraction
-takes the first balanced ``{...}`` span, so leading or trailing prose is
-tolerated.
+One JSON object per seat per plan turn (optionally wrapped in a single outer
+Markdown `````json ... ````` fence). Extra surrounding prose is rejected;
+unknown keys are ignored; omitted optional fields use documented defaults,
+while explicitly provided invalid values are rejected.
 
 Every free-text field is truncated on **rune** boundaries, never byte
 boundaries -- a byte-cut multi-byte rune is exactly what makes replay bytes
@@ -15,6 +16,7 @@ engine ``talk`` string and every error string that can reach the replay.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,19 +41,22 @@ ERROR_RUNES = 240
 RECIPES: tuple[str, ...] = ("salad", "soup", "fries", "any")
 ZONES: tuple[str, ...] = ("left", "right", "pass", "any")
 
-FALLBACK_CAUSES: tuple[str, ...] = (
+REJECTION_CAUSES: tuple[str, ...] = (
     "timeout",
     "parse",
     "illegal_station",
+    "invalid_field",
     "rate_budget",
     "transport",
     "disabled",
 )
 
 RETRY_HINT = (
-    "Your last reply was not usable. Reply with ONE JSON object beginning with "
-    "{ and a station from LEGAL STATIONS."
+    "Your last reply was rejected. Reply with ONLY one JSON object "
+    '(optionally in a ```json ... ``` fence) with "station" from LEGAL STATIONS.'
 )
+
+_OUTER_FENCE_RE = re.compile(r"^```(?:json)?[ \t]*\r?\n(.*?)\r?\n```$", re.IGNORECASE | re.DOTALL)
 
 
 def truncate_runes(text: Any, cap: int) -> str:
@@ -67,11 +72,11 @@ def truncate_runes(text: Any, cap: int) -> str:
 
 
 class PlanError(Exception):
-    """A reply that cannot become a directive. Carries its fallback cause."""
+    """A reply that cannot become a directive. Carries its rejection cause."""
 
     def __init__(self, cause: str, detail: str = "") -> None:
         super().__init__(f"{cause}: {detail}" if detail else cause)
-        self.cause = cause if cause in FALLBACK_CAUSES else "parse"
+        self.cause = cause if cause in REJECTION_CAUSES else "parse"
         self.detail = truncate_runes(detail, ERROR_RUNES)
 
 
@@ -121,45 +126,58 @@ class ParsedPlan:
 
 
 def extract_object(text: str) -> str:
-    """The first balanced `{...}` span in `text`.
+    """Extract a single JSON object, optionally wrapped in one outer Markdown fence.
 
-    Prose before or after the object is tolerated; a brace inside a JSON string
-    literal does not count toward the balance.
+    Arbitrary leading or trailing prose is rejected rather than scraped.
     """
     if not isinstance(text, str):
         raise PlanError("parse", "reply was not text")
-    start = text.find("{")
-    if start < 0:
-        raise PlanError("parse", "no JSON object in the reply")
-    depth = 0
-    in_string = False
-    escaped = False
-    for index in range(start, len(text)):
-        ch = text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    raise PlanError("parse", "unbalanced JSON object in the reply")
+    stripped = text.strip()
+    if not stripped:
+        raise PlanError("parse", "empty reply")
+    if stripped.startswith("```"):
+        match = _OUTER_FENCE_RE.match(stripped)
+        if not match:
+            raise PlanError("parse", "malformed markdown code fence")
+        stripped = match.group(1).strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        raise PlanError("parse", "reply must be a single JSON object")
+    return stripped
+
+
+def _parse_optional_enum(
+    raw: dict[str, Any],
+    key: str,
+    allowed: tuple[str, ...] | list[str],
+    default: str,
+    cap: int,
+) -> str:
+    if key not in raw or raw[key] is None:
+        return default
+    value = raw[key]
+    if not isinstance(value, str):
+        raise PlanError("invalid_field", f"{key} must be a string")
+    cleaned = truncate_runes(value, cap)
+    if cleaned not in allowed:
+        raise PlanError("invalid_field", f"{key}={cleaned or '(empty)'}")
+    return cleaned
+
+
+def _parse_optional_text(raw: dict[str, Any], key: str, cap: int) -> str:
+    if key not in raw or raw[key] is None:
+        return ""
+    value = raw[key]
+    if not isinstance(value, str):
+        raise PlanError("invalid_field", f"{key} must be a string")
+    return truncate_runes(value, cap)
 
 
 def parse_plan(text: str, legal_stations: list[str], ally_aliases: list[str]) -> ParsedPlan:
-    """Validate one reply against `LEGAL STATIONS` and the caps.
+    """Validate one reply against `LEGAL STATIONS` and the schema.
 
-    `station` outside the legal set is the one **illegal** outcome; every other
-    field degrades to its default rather than failing the reply.
+    `station` is required and must be in `legal_stations`. Omitted optional
+    fields use their documented defaults; explicitly provided invalid values
+    or wrong types are rejected rather than silently coerced.
     """
     span = extract_object(text)
     try:
@@ -169,22 +187,19 @@ def parse_plan(text: str, legal_stations: list[str], ally_aliases: list[str]) ->
     if not isinstance(raw, dict):
         raise PlanError("parse", "reply was not a JSON object")
 
-    station = truncate_runes(raw.get("station"), STATION_CAP).lower()
+    raw_station = raw.get("station")
+    if not isinstance(raw_station, str):
+        raise PlanError("illegal_station", "station=(missing or non-string)")
+    station = truncate_runes(raw_station, STATION_CAP)
     if station not in legal_stations:
         raise PlanError("illegal_station", f"station={station or '(missing)'}")
 
-    recipe = truncate_runes(raw.get("recipe"), RECIPE_CAP).lower()
-    if recipe not in RECIPES:
-        recipe = "any"
-    zone = truncate_runes(raw.get("zone"), ZONE_CAP).lower()
-    if zone not in ZONES:
-        zone = "any"
-    handoff = truncate_runes(raw.get("handoff"), ALIAS_CAP)
-    if handoff not in ally_aliases:
-        handoff = "none"
-    yield_to = truncate_runes(raw.get("yield_to"), ALIAS_CAP)
-    if yield_to not in ally_aliases:
-        yield_to = "none"
+    recipe = _parse_optional_enum(raw, "recipe", RECIPES, "any", RECIPE_CAP)
+    zone = _parse_optional_enum(raw, "zone", ZONES, "any", ZONE_CAP)
+    handoff = _parse_optional_enum(raw, "handoff", ally_aliases, "none", ALIAS_CAP)
+    yield_to = _parse_optional_enum(raw, "yield_to", ally_aliases, "none", ALIAS_CAP)
+    say = _parse_optional_text(raw, "say", SAY_RUNES)
+    note = _parse_optional_text(raw, "note", NOTE_RUNES)
 
     return ParsedPlan(
         station=station,
@@ -192,6 +207,6 @@ def parse_plan(text: str, legal_stations: list[str], ally_aliases: list[str]) ->
         zone=zone,
         handoff=handoff,
         yield_to=yield_to,
-        say=truncate_runes(raw.get("say"), SAY_RUNES),
-        note=truncate_runes(raw.get("note"), NOTE_RUNES),
+        say=say,
+        note=note,
     )

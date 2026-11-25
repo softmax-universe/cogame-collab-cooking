@@ -14,7 +14,24 @@ import asyncio
 
 import pytest
 
-from collab_cooking.coworld.player import connect_with_retry
+from collab_cooking.coworld.player import connect_with_retry, registration
+
+
+def test_registration_requires_explicit_prompt_or_valid_scripted(monkeypatch) -> None:
+    monkeypatch.delenv("PLAYER_PROMPT", raising=False)
+    monkeypatch.delenv("PLAYER_SCRIPTED", raising=False)
+    with pytest.raises(ValueError, match="PLAYER_PROMPT or a valid PLAYER_SCRIPTED"):
+        registration()
+
+    monkeypatch.setenv("PLAYER_SCRIPTED", "unknown-bot")
+    with pytest.raises(ValueError, match="PLAYER_PROMPT or a valid PLAYER_SCRIPTED"):
+        registration()
+
+    monkeypatch.setenv("PLAYER_SCRIPTED", "passer")
+    assert registration() == {"type": "register", "kind": "scripted", "baseline": "passer"}
+
+    monkeypatch.setenv("PLAYER_PROMPT", "Cook soup")
+    assert registration() == {"type": "register", "kind": "prompt", "prompt": "Cook soup"}
 
 
 def test_the_dial_retries_until_the_game_is_listening() -> None:

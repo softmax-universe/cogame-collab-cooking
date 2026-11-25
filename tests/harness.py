@@ -55,11 +55,14 @@ class FakeSocket:
         kind = message.get("type")
         if kind == "player_config":
             baseline = self.registration.get("baseline", "brigade")
-            self.seat.configure(message, baseline)
+            self.seat.configure(message, baseline, kind=self.registration["kind"])
             self.configured = True
         elif kind == "observation":
             step = int(message["step"])
-            action_name, task = self.seat.observe(message)
+            decision = self.seat.observe(message)
+            if decision is None:
+                return
+            action_name, task = decision
             self.actions.append((step, action_name))
             await self.episode.handle_player_message(
                 self.connection_id,
