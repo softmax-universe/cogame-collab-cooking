@@ -14,7 +14,7 @@ from collab_cooking.coworld.results import (
     max_tickets,
     seat_scores,
 )
-from tests.harness import fast_cert_config, prompt_registration, run_episode, scripted_registration
+from tests.harness import fast_cert_config, run_episode, scripted_registration
 
 
 def sample(**overrides) -> dict:
@@ -44,9 +44,7 @@ def sample(**overrides) -> dict:
 def test_score_is_team_dishes_plus_an_epsilon_of_own_deliveries() -> None:
     delivered = [12, 10, 9, 6]
     dishes = sum(delivered)
-    assert seat_scores(delivered) == [
-        pytest.approx(dishes + EPSILON * value) for value in delivered
-    ]
+    assert seat_scores(delivered) == [pytest.approx(dishes + EPSILON * value) for value in delivered]
     results = sample()
     assert results["dishes"] == dishes
     assert results["scores"] == seat_scores(delivered)
@@ -74,8 +72,7 @@ def test_the_epsilon_can_never_reorder_two_different_team_totals() -> None:
 
 def test_scores_never_decrease_over_an_episode() -> None:
     out = run_episode(
-        fast_cert_config(max_steps=240, step_seconds=0.0, shutdown_grace_seconds=0.0,
-                         player_connect_timeout_seconds=2),
+        fast_cert_config(max_steps=240, step_seconds=0.0, shutdown_grace_seconds=0.0, player_connect_timeout_seconds=2),
         [scripted_registration("brigade") for _ in range(4)],
         Path(tempfile.mkdtemp()),
     )
@@ -91,8 +88,17 @@ def test_scores_never_decrease_over_an_episode() -> None:
 
 def test_results_shape() -> None:
     results = sample()
-    for key in ("scores", "delivered", "names", "aliases", "seat_kinds", "disconnected",
-                "plan_rejections", "blocked_moves", "handoffs"):
+    for key in (
+        "scores",
+        "delivered",
+        "names",
+        "aliases",
+        "seat_kinds",
+        "disconnected",
+        "plan_rejections",
+        "blocked_moves",
+        "handoffs",
+    ):
         assert len(results[key]) == 4, key
     assert results["reason"] in LEGAL_REASONS
     assert set(results["served_by_recipe"]) == {"salad", "soup", "fries"}
@@ -110,30 +116,3 @@ def test_cross_play_is_true_when_an_external_or_prompt_policy_sits_with_scripted
     assert not sample(seat_kinds=["prompt"] * 4)["cross_play"]
     assert not sample(seat_kinds=["external"] * 4)["cross_play"]
     assert not sample(seat_kinds=["scripted:brigade"] * 4)["cross_play"]
-
-
-def test_a_real_episode_reports_cross_play_and_its_seat_kinds() -> None:
-    from collab_cooking.coworld.llm import LlmPlanner
-    from tests.test_llm import StubTransport
-
-    planner = LlmPlanner(
-        transport=StubTransport(['{"station":"chop","recipe":"soup","say":"chopping"}']),
-        max_workers=1,
-        timeout_seconds=5,
-    )
-    out = run_episode(
-        fast_cert_config(max_steps=120, step_seconds=0.0, shutdown_grace_seconds=0.0,
-                         player_connect_timeout_seconds=2),
-        [prompt_registration(), scripted_registration("brigade"),
-         scripted_registration("passer"), scripted_registration("courier")],
-        Path(tempfile.mkdtemp()),
-        planner=planner,
-    )
-    planner.shutdown()
-    results = out["results"]
-    assert results["seat_kinds"] == [
-        "prompt", "scripted:brigade", "scripted:passer", "scripted:courier"
-    ]
-    assert results["cross_play"] is True
-    assert results["dishes"] == sum(results["delivered"])
-    assert results["scores"] == seat_scores(results["delivered"])

@@ -30,7 +30,13 @@ Each variant is one hand-authored room that isolates one coordination problem.
 ## Bundled policies
 
 Both champions are prompt policies. A seat registers with `PLAYER_PROMPT=<your standing orders>`
-and the game asks an LLM for one **shift order** every 50 ticks:
+and the game grants a private window for one **shift order** every 50 ticks.
+The platform-hosted player calls its native sidecar; direct provider endpoints
+and credential fallback paths are removed:
+
+The bundled prompt player declares `COWORLD_LLM_ENABLED=true` so hosted execution
+attaches that sidecar. Local Docker certification must supply a sidecar endpoint;
+it cannot certify the prompt seat without one. Scripted seats do not require it.
 
 ```json
 {"station":"chop","recipe":"soup","zone":"left","handoff":"Cog-D","yield_to":"none",
@@ -42,11 +48,11 @@ order. The plan chooses *which job, which recipe, which half of the room, who to
 yield to*; the executor chooses *which tile next*. `say` is heard by your team-mates next turn
 and shown to spectators; `note` is private and comes back only to you.
 
-The same image also ships four scripted baselines, selected explicitly with
-`PLAYER_SCRIPTED=brigade|runner|passer|courier`. Prompt seats never fall back to a
-scripted baseline: a failed or missing plan turn is explicitly rejected (preserving
-the raw model reply) and the clocked kitchen advances with recorded missed turns until
-a valid plan is accepted.
+The same image also ships four scripted baselines, selected with
+`PLAYER_SCRIPTED=brigade|runner|passer|courier`. The engine waits for every native seat’s first accepted plan before advancing the first tick.
+An unavailable seat or exhausted plan window ends the episode unscored. Public completion additionally requires
+observed reader, player and engine joins; unresolved owners retain private
+evidence and withhold final outputs. See [training evidence](TRAINING.md).
 
 ## Scoring
 

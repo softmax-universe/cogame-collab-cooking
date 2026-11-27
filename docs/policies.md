@@ -5,8 +5,9 @@ The bundled prompt and scripted policies share `/bin/collab-cooking-player`.
 ## `PLAYER_PROMPT` -- a prompt policy
 
 Set `PLAYER_PROMPT` to your standing orders (up to 1200 runes). The seat registers as a prompt
-seat and the **game** asks the model for one shift order every 50 ticks -- roughly ten seconds of
-wall clock -- while a scripted executor in the player container walks the cog tick by tick until
+seat. The game grants simultaneous private windows every 50 ticks, at least ten seconds
+apart. The **player** calls its registered native sidecar and parses one shift order,
+while a scripted executor in the player container walks the cog tick by tick until
 the next order lands. Two clocks: the model picks the job, the executor picks the tile.
 
 The model sees only what that seat can see: its own 13x13 window, its remembered world model
@@ -16,26 +17,18 @@ never sees the seed, the ticket schedule, another seat's plan, or any real polic
 
 ### The reply
 
-One JSON object, optionally wrapped in a single outer Markdown ```` ```json ... ``` ```` fence,
-and no extra surrounding prose; unknown keys are ignored. Only `station` is required; omitted
-optional fields use the defaults below, while explicitly provided invalid values or wrong types
-are rejected.
+One JSON object, nothing else, beginning with `{`. Leading or trailing prose is tolerated
+(extraction takes the first balanced `{...}` span); unknown keys are ignored.
 
-Example:
-
-```json
-{"station":"chop","recipe":"soup","zone":"any","handoff":"none","yield_to":"none","say":"Chopping veg for soup","note":""}
-```
-
-| field      | type                      | cap       | default (when omitted) / invalid behavior                                                                |
-| ---------- | ------------------------- | --------- | -------------------------------------------------------------------------------------------------------- |
-| `station`  | enum                      | 12 chars  | required; must be a member of `LEGAL STATIONS` -- anything else is **illegal**: one retry, then rejected |
-| `recipe`   | `salad\|soup\|fries\|any` | 6 chars   | defaults to `any` when omitted; explicit invalid value is **rejected**                                   |
-| `zone`     | `left\|right\|pass\|any`  | 6 chars   | defaults to `any` when omitted; explicit invalid value is **rejected**                                   |
-| `handoff`  | an ally alias or `none`   | 8 chars   | defaults to `none` when omitted; explicit invalid value is **rejected**                                  |
-| `yield_to` | an ally alias or `none`   | 8 chars   | defaults to `none` when omitted; explicit invalid value is **rejected**                                  |
-| `say`      | free text                 | 120 runes | defaults to `""`; truncated on a rune boundary; broadcast to the team next turn and to spectators        |
-| `note`     | free text                 | 200 runes | defaults to `""`; truncated on a rune boundary; private, echoed back only to you, never written to replay |
+| field      | type                      | cap       | invalid becomes                                                                                    |
+| ---------- | ------------------------- | --------- | -------------------------------------------------------------------------------------------------- |
+| `station`  | enum                      | 12 chars  | must be a member of `LEGAL STATIONS` -- anything else is **illegal**: one repair within the original deadline |
+| `recipe`   | `salad\|soup\|fries\|any` | 6 chars   | `any`                                                                                              |
+| `zone`     | `left\|right\|pass\|any`  | 6 chars   | `any`                                                                                              |
+| `handoff`  | an ally alias or `none`   | 8 chars   | `none`                                                                                             |
+| `yield_to` | an ally alias or `none`   | 8 chars   | `none`                                                                                             |
+| `say`      | free text                 | 120 runes | truncated on a rune boundary; broadcast to the team next turn and to spectators                    |
+| `note`     | free text                 | 200 runes | truncated on a rune boundary; private, echoed back only to you, never written to the replay        |
 
 `LEGAL STATIONS` is precomputed by the same predicate the validator applies -- the stations
 reachable from your current tile in this kitchen -- so in `forced` a left-half cog is never
@@ -62,22 +55,16 @@ offered it.
 5. `yield_to = <alias>`: if that ally is cardinally adjacent and your next step would be onto
    their tile, step to the first free perpendicular tile, else stand still for that tick.
 
-### Plan failures and rejections
+### Failed decisions
 
-Prompt seats never fall back to a scripted baseline or synthesize actions when no valid plan is active.
-
-| failure                                            | response                                                                                                                                                     |
-| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| the call times out (12 s)                          | **retry once**, that seat only, with a hint                                                                                                                  |
-| the reply is not valid JSON (or outer JSON fence)  | the same single retry; raw submitted reply is preserved in the attempt record                                                                                |
-| `station` is not in `LEGAL STATIONS` or field bad  | the same single retry; raw submitted reply is preserved in the attempt record                                                                                |
-| the retry also fails                               | the plan is **rejected** (`plan_rejected` event, `results.plan_rejections[slot]` incremented); the seat sends no synthesized action and misses ticks until a valid plan lands |
-| the rolling 26 requests/minute budget is exhausted | the turn is rejected for that seat, cause `rate_budget`                                                                                                      |
-| no credentials at all                              | the client is **disabled at startup and makes zero network calls**; prompt plan turns are rejected with cause `disabled` and no scripted baseline runs       |
+A rejected proposal may use one repair within its original grant deadline.
+If the seat cannot supply a valid plan, the game records the seat and reason and ends unscored.
+The first grant must succeed before the first physics tick.
+Missing registrations, disconnected players and missing physical controls also end the episode unscored.
 
 ## `PLAYER_SCRIPTED` -- the baselines
 
-Four names, all the same brain with one parameter changed. Must be selected explicitly.
+Four names, all the same brain with one parameter changed.
 
 - **`brigade`** -- roles: slot 0 prep, 1 cook, 2 server, 3
   all-rounder. Dirty plate to the sink; servable dish to the pass (via the board if that recipe

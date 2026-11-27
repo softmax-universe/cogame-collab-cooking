@@ -20,6 +20,8 @@ A frame the recorder invented, dropped or mistimed fails here.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -40,45 +42,38 @@ BLOCKED_BIT = 1
 @pytest.fixture(scope="module")
 def document(tmp_path_factory) -> dict:
     """One real episode, read back as the bytes the viewer would be served."""
-    from collab_cooking.coworld.llm import LlmPlanner
-    from tests.test_llm import StubTransport
-
-    planner = LlmPlanner(
-        transport=StubTransport(['{"station":"chop","recipe":"soup","say":"chopping"}']),
-        max_workers=1,
-        timeout_seconds=5,
-    )
-    out = run_episode(
-        fast_cert_config(
-            max_steps=240,
-            step_seconds=0.0,
-            shutdown_grace_seconds=0.0,
-            player_connect_timeout_seconds=2,
-            plan_interval_steps=60,
-            min_plan_interval_seconds=0.0,
-        ),
-        # A prompt seat contributes `plan` events: the replay carries events
-        # the sim cannot produce as well as those it can, and the re-derivation
-        # has to keep them apart.
-        [
-            prompt_registration("Keep the pot busy."),
-            scripted_registration("brigade"),
-            scripted_registration("passer"),
-            scripted_registration("courier"),
-        ],
-        Path(tmp_path_factory.mktemp("rederive")),
-        planner=planner,
-    )
-    planner.shutdown()
+    fixture = Path(__file__).resolve().parents[1] / "tools/ci/model_fixture.py"
+    with subprocess.Popen([sys.executable, str(fixture)], stdout=subprocess.PIPE, text=True) as server:
+        try:
+            assert server.stdout is not None
+            port = int(server.stdout.readline().removeprefix("PORT="))
+            out = run_episode(
+                fast_cert_config(
+                    max_steps=240,
+                    step_seconds=0.0,
+                    shutdown_grace_seconds=0.0,
+                    player_connect_timeout_seconds=2,
+                    plan_interval_steps=60,
+                    min_plan_interval_seconds=0.0,
+                ),
+                [
+                    prompt_registration("Keep the pot busy."),
+                    scripted_registration("brigade"),
+                    scripted_registration("passer"),
+                    scripted_registration("courier"),
+                ],
+                Path(tmp_path_factory.mktemp("rederive")),
+                endpoint=f"http://127.0.0.1:{port}",
+            )
+        finally:
+            server.terminate()
     return json.loads(out["replay_bytes"].decode("utf-8"))
 
 
 def rebuild(document: dict) -> replay_mod.ReplayWriter:
     """Replay the recorded actions through a fresh sim, recording as we go."""
     config = document["config"]
-    env = make_kitchen_mission(
-        config["layout"], config["max_steps"], num_agents=config["num_agents"]
-    )
+    env = make_kitchen_mission(config["layout"], config["max_steps"], num_agents=config["num_agents"])
     sim = Simulator().new_simulation(env, seed=document["seed"])
     num_agents = int(config["num_agents"])
     aliases = [seat["alias"] for seat in document["seats"]]
@@ -146,9 +141,7 @@ def test_the_re_derivation_is_not_vacuous(document: dict) -> None:
     ticks = document["ticks"]
     assert len(ticks) == 240
     assert sum(len(tick.get("ev", [])) for tick in ticks) > 100
-    # Slot 0 is a prompt seat with no credentials (no brigade fallback), so
-    # three scripted seats drive station updates while slot 0 records missed turns.
-    assert sum(1 for tick in ticks if "st" in tick) > 40
+    assert sum(1 for tick in ticks if "st" in tick) > 100
     carried = {entry[2] for tick in ticks for entry in tick["c"]}
     assert len(carried) > 2, carried
 

@@ -17,10 +17,9 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
 from typing import Any
 
-from collab_cooking.agent.brain.policy import PlanDirective
+from collab_cooking.coworld.plan_protocol import PlanControl
 
 # Field caps, exactly as the design note's table states them.
 STATION_CAP = 12
@@ -80,51 +79,6 @@ class PlanError(Exception):
         self.detail = truncate_runes(detail, ERROR_RUNES)
 
 
-@dataclass(frozen=True, slots=True)
-class ParsedPlan:
-    """A validated reply, ready to become a `PlanDirective`.
-
-    `note` is private: it is echoed back only to its own seat and is **never**
-    written to the replay.
-    """
-
-    station: str
-    recipe: str
-    zone: str
-    handoff: str
-    yield_to: str
-    say: str
-    note: str
-
-    def directive(self, turn: int, src: str) -> PlanDirective:
-        return PlanDirective(
-            turn=turn,
-            station=self.station,
-            recipe=self.recipe,
-            zone=self.zone,
-            handoff=self.handoff,
-            yield_to=self.yield_to,
-            say=self.say,
-            src=src,
-        )
-
-    def replay_event(self, slot: int, alias: str, turn: int, src: str) -> dict[str, Any]:
-        """The `plan` event. Carries no `note` -- that is the point."""
-        return {
-            "ev": "plan",
-            "slot": slot,
-            "alias": alias,
-            "turn": turn,
-            "station": self.station,
-            "recipe": self.recipe,
-            "zone": self.zone,
-            "handoff": self.handoff,
-            "yield_to": self.yield_to,
-            "say": self.say,
-            "src": src,
-        }
-
-
 def extract_object(text: str) -> str:
     """Extract a single JSON object, optionally wrapped in one outer Markdown fence.
 
@@ -172,7 +126,7 @@ def _parse_optional_text(raw: dict[str, Any], key: str, cap: int) -> str:
     return truncate_runes(value, cap)
 
 
-def parse_plan(text: str, legal_stations: list[str], ally_aliases: list[str]) -> ParsedPlan:
+def parse_plan(text: str, legal_stations: list[str], ally_aliases: list[str]) -> PlanControl:
     """Validate one reply against `LEGAL STATIONS` and the schema.
 
     `station` is required and must be in `legal_stations`. Omitted optional
@@ -201,7 +155,7 @@ def parse_plan(text: str, legal_stations: list[str], ally_aliases: list[str]) ->
     say = _parse_optional_text(raw, "say", SAY_RUNES)
     note = _parse_optional_text(raw, "note", NOTE_RUNES)
 
-    return ParsedPlan(
+    return PlanControl(
         station=station,
         recipe=recipe,
         zone=zone,
