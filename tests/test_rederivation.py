@@ -20,6 +20,8 @@ A frame the recorder invented, dropped or mistimed fails here.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -29,6 +31,7 @@ from collab_cooking.coworld import replay as replay_mod
 from collab_cooking.missions.kitchen import make_kitchen_mission
 from tests.harness import (
     fast_cert_config,
+    prompt_registration,
     run_episode,
     scripted_registration,
 )
@@ -39,23 +42,31 @@ BLOCKED_BIT = 1
 @pytest.fixture(scope="module")
 def document(tmp_path_factory) -> dict:
     """One real episode, read back as the bytes the viewer would be served."""
-    out = run_episode(
-        fast_cert_config(
-            max_steps=240,
-            step_seconds=0.0,
-            shutdown_grace_seconds=0.0,
-            player_connect_timeout_seconds=2,
-            plan_interval_steps=60,
-            min_plan_interval_seconds=0.0,
-        ),
-        [
-            scripted_registration("runner"),
-            scripted_registration("brigade"),
-            scripted_registration("passer"),
-            scripted_registration("courier"),
-        ],
-        Path(tmp_path_factory.mktemp("rederive")),
-    )
+    fixture = Path(__file__).resolve().parents[1] / "tools/ci/model_fixture.py"
+    with subprocess.Popen([sys.executable, str(fixture)], stdout=subprocess.PIPE, text=True) as server:
+        try:
+            assert server.stdout is not None
+            port = int(server.stdout.readline().removeprefix("PORT="))
+            out = run_episode(
+                fast_cert_config(
+                    max_steps=240,
+                    step_seconds=0.0,
+                    shutdown_grace_seconds=0.0,
+                    player_connect_timeout_seconds=2,
+                    plan_interval_steps=60,
+                    min_plan_interval_seconds=0.0,
+                ),
+                [
+                    prompt_registration("Keep the pot busy."),
+                    scripted_registration("brigade"),
+                    scripted_registration("passer"),
+                    scripted_registration("courier"),
+                ],
+                Path(tmp_path_factory.mktemp("rederive")),
+                endpoint=f"http://127.0.0.1:{port}",
+            )
+        finally:
+            server.terminate()
     return json.loads(out["replay_bytes"].decode("utf-8"))
 
 

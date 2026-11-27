@@ -29,7 +29,7 @@ async def test_source_private_teacher_reaches_actual_cpp_and_common_canonical_pr
     for decision in complete.decisions:
         assert decision.action_status == "accepted"
         assert decision.execution.control_encoding == "u8-u8"
-        assert decision.execution.start_tick == 1 and decision.execution.end_tick == 12
+        assert decision.execution.start_tick == 0 and decision.execution.end_tick == 12
         attempt = decision.attempts[0]
         assert attempt.origin == "teacher" and attempt.policy == TEACHER_POLICY
         assert attempt.platform_call_id is None and attempt.generation_id is None
