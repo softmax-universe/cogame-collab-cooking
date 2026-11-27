@@ -64,7 +64,7 @@ const
     "chop_start", "chop_done", "pot_load", "pot_start", "pot_ready",
     "pot_burn", "pot_clear", "fry_start", "fry_ready", "fry_burn",
     "fry_clear", "plate_up", "serve", "wash_start", "wash_done", "blocked",
-    "plan", "fallback", "deadline", "episode_end"
+    "plan", "plan_rejected", "action_fallback", "deadline", "episode_end"
   ]
   RequiredKeys = ["format", "protocol", "config", "seed", "kitchen", "seats",
                   "ticks", "heat", "results"]
@@ -713,12 +713,15 @@ proc absorb(tick: Tick) =
         feedAll.add FeedLine(t: tick.t, kind: "say",
           text: truncRunes(event{"alias"}.getStr("a cog"), AliasRunes) & ": " &
                 truncRunes(event{"say"}.getStr(""), SayRunes))
-    of "fallback":
+    of "plan_rejected":
       let slot = event{"slot"}.getInt(0)
       if slot >= 0 and slot < seatPending.len: seatPending[slot] = false
+      if slot >= 0 and slot < seatJob.len: seatJob[slot] = ""
       feedAll.add FeedLine(t: tick.t, kind: "fallback",
-        text: event{"alias"}.getStr("a cog") & " fell back to brigade - " &
+        text: event{"alias"}.getStr("a cog") & " plan rejected - " &
               event{"cause"}.getStr("unknown"))
+    of "action_fallback":
+      discard
     else: discard
   if feedAll.len > 400:
     feedAll.delete(0)

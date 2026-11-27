@@ -29,7 +29,6 @@ from collab_cooking.coworld import replay as replay_mod
 from collab_cooking.missions.kitchen import make_kitchen_mission
 from tests.harness import (
     fast_cert_config,
-    prompt_registration,
     run_episode,
     scripted_registration,
 )
@@ -49,11 +48,8 @@ def document(tmp_path_factory) -> dict:
             plan_interval_steps=60,
             min_plan_interval_seconds=0.0,
         ),
-        # A native seat with an unreachable diagnostic endpoint contributes `fallback` events: the
-        # replay carries events the sim cannot produce as well as those it can,
-        # and the re-derivation has to keep them apart.
         [
-            prompt_registration("Keep the pot busy."),
+            scripted_registration("runner"),
             scripted_registration("brigade"),
             scripted_registration("passer"),
             scripted_registration("courier"),

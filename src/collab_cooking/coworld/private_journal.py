@@ -98,6 +98,13 @@ class EngineOutcome(PrivateModel):
     results: dict[str, JsonValue]
 
 
+class EngineFailure(PrivateModel):
+    kind: Literal["engine_failure"] = "engine_failure"
+    failed_policy_index: StrictInt = Field(ge=0, lt=4)
+    failure_kind: Literal["episode_inconclusive", "player_error"]
+    message: str
+
+
 Record = Annotated[
     SourceRecord
     | RegisteredPolicies
@@ -109,7 +116,8 @@ Record = Annotated[
     | TeacherCall
     | InstalledMacro
     | EngineApplication
-    | EngineOutcome,
+    | EngineOutcome
+    | EngineFailure,
     Field(discriminator="kind"),
 ]
 RECORD = TypeAdapter(Record)

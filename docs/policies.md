@@ -22,7 +22,7 @@ One JSON object, nothing else, beginning with `{`. Leading or trailing prose is 
 
 | field      | type                      | cap       | invalid becomes                                                                                    |
 | ---------- | ------------------------- | --------- | -------------------------------------------------------------------------------------------------- |
-| `station`  | enum                      | 12 chars  | must be a member of `LEGAL STATIONS` -- anything else is **illegal**: one retry, then the fallback |
+| `station`  | enum                      | 12 chars  | must be a member of `LEGAL STATIONS` -- anything else is **illegal**: one repair within the original deadline |
 | `recipe`   | `salad\|soup\|fries\|any` | 6 chars   | `any`                                                                                              |
 | `zone`     | `left\|right\|pass\|any`  | 6 chars   | `any`                                                                                              |
 | `handoff`  | an ally alias or `none`   | 8 chars   | `none`                                                                                             |
@@ -55,22 +55,18 @@ offered it.
 5. `yield_to = <alias>`: if that ally is cardinally adjacent and your next step would be onto
    their tile, step to the first free perpendicular tile, else stand still for that tick.
 
-### Degrading
+### Failed decisions
 
-| failure | response |
-| --- | --- |
-| the call times out (12 s) | **retry once**, that seat only, with a hint |
-| the reply is not JSON, or has no balanced object | the same single retry |
-| `station` is not in `LEGAL STATIONS` | the same single retry |
-| the retry also fails | that seat plays `brigade` until the next plan turn, with a `fallback` event naming the cause |
-| the rolling 26 requests/minute budget is exhausted | the turn is skipped for that seat, cause `rate_budget` |
-| missing native sidecar endpoint | the native player fails startup; select an explicit scripted baseline for diagnostic play |
+A rejected proposal may use one repair within its original grant deadline.
+If the seat cannot supply a valid plan, the game records the seat and reason and ends unscored.
+The first grant must succeed before the first physics tick.
+Missing registrations, disconnected players and missing physical controls also end the episode unscored.
 
 ## `PLAYER_SCRIPTED` -- the baselines
 
 Four names, all the same brain with one parameter changed.
 
-- **`brigade`** (the default, and the fallback) -- roles: slot 0 prep, 1 cook, 2 server, 3
+- **`brigade`** -- roles: slot 0 prep, 1 cook, 2 server, 3
   all-rounder. Dirty plate to the sink; servable dish to the pass (via the board if that recipe
   has no live ticket); otherwise the role branch, which prioritises a ready-or-burned cooker,
   then the deepest queue, then the next missing ingredient.

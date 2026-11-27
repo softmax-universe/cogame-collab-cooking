@@ -29,6 +29,9 @@ def test_scripted_registration_does_not_silently_replace_an_unknown_policy(monke
     episode = build_episode({"layout": "open-kitchen"})
     configuration = PlayerConfiguration.model_validate(episode.player_config_message(0, "fixture"))
     monkeypatch.delenv("PLAYER_PROMPT", raising=False)
+    monkeypatch.delenv("PLAYER_SCRIPTED", raising=False)
+    with pytest.raises(KeyError, match="PLAYER_SCRIPTED"):
+        registration(configuration)
     monkeypatch.setenv("PLAYER_SCRIPTED", "not-a-baseline")
     with pytest.raises(ValidationError):
         registration(configuration)

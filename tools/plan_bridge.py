@@ -44,6 +44,12 @@ class PlanBridge:
         episode = self.episode
         while episode.sim.current_step < self.config.max_steps and not episode.sim.is_done():
             step = int(episode.sim.current_step)
+            if step % self.config.plan_interval_steps == 0 and self._last_plan_step != step:
+                self._last_plan_step = step
+                episode.turn += 1
+                self.requests = [episode.private_window(seat.slot, NativeProfile()) for seat in episode.seats]
+                self.views = [episode._seat_view(seat) for seat in episode.seats]
+                return self.observation()
             actions = []
             for slot, player in enumerate(self.players):
                 observation = PhysicalObservation(
@@ -71,11 +77,6 @@ class PlanBridge:
             episode._absorb(events)
             episode.state = current
             episode._update_prompt_memory()
-            if step % self.config.plan_interval_steps == 0:
-                episode.turn += 1
-                self.requests = [episode.private_window(seat.slot, NativeProfile()) for seat in episode.seats]
-                self.views = [episode._seat_view(seat) for seat in episode.seats]
-                return self.observation()
         return {
             "kind": "terminal",
             "scores": {str(slot): score for slot, score in enumerate(seat_scores(episode.delivered()))},
@@ -143,6 +144,7 @@ class PlanBridge:
                     self.players.append(player)
                 self.episode.state = replay.capture(self.episode.sim, 4)
                 self.decision_id = 0
+                self._last_plan_step = -1
                 self.pending = []
                 return self.advance()
             case "teacher":

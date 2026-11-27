@@ -25,7 +25,7 @@ from collab_cooking.kitchens.layouts import (  # noqa: E402
 )
 
 IMAGE = "{{COLLAB_COOKING_IMAGE}}"
-SOURCE_URL = "https://github.com/Metta-AI/cogame-collab-cooking/tree/main"
+SOURCE_URL = "https://github.com/softmax-universe/cogame-collab-cooking/tree/main"
 GAME_NAME = "collab_cooking"
 OWNER = "daveey@softmax.com"
 SLUG = "collab-cooking"
@@ -58,7 +58,7 @@ BUNDLED_PLAYERS = [
         "id": "collab-prompt",
         "name": "Reference prompt",
         "description": "The reference prompt policy: an LLM shift order every 50 ticks.",
-        "env": {"PLAYER_PROMPT": REFERENCE_PROMPT, "COWORLD_LLM_ENABLED": "true"},
+        "env": {"PLAYER_PROMPT": REFERENCE_PROMPT, "COWORLD_LLM_ENABLED": "true", "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"},
     },
     {
         "id": "brigade",
@@ -152,10 +152,6 @@ def config_schema() -> dict:
             "min_plan_interval_seconds": {"type": "number", "minimum": 0, "maximum": 120},
             "plan_timeout_seconds": {"type": "number", "minimum": 1, "maximum": 60},
             "llm_max_requests_per_minute": {"type": "integer", "minimum": 1, "maximum": 120},
-            "fallback_scripted": {
-                "type": "string",
-                "enum": ["brigade", "runner", "passer", "courier"],
-            },
             "play_budget_fraction": {"type": "number", "minimum": 0.05, "maximum": 1.0},
             "episode_timeout_seconds": {"type": "number", "minimum": 30, "maximum": 3600},
             "shutdown_grace_seconds": {"type": "number", "minimum": 0, "maximum": 120},
@@ -206,7 +202,7 @@ def results_schema() -> dict:
             "seat_kinds",
             "cross_play",
             "disconnected",
-            "fallbacks",
+            "plan_rejections",
             "action_fallbacks",
             "llm_requests",
         ],
@@ -258,7 +254,7 @@ def results_schema() -> dict:
                 "minItems": NUM_AGENTS,
                 "maxItems": NUM_AGENTS,
             },
-            "fallbacks": bounded_int_array("Plan turns this seat fell back to its baseline."),
+            "plan_rejections": bounded_int_array("Plan turns rejected or missed."),
             "action_fallbacks": {
                 "type": "array",
                 "minItems": NUM_AGENTS,

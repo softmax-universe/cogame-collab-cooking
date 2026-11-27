@@ -30,7 +30,7 @@ def registration(configuration: PlayerConfiguration) -> Registration:
             ),
         )
     return ScriptedRegistration.model_validate(
-        {"slot": configuration.slot, "baseline": os.environ.get("PLAYER_SCRIPTED", "brigade")}
+        {"slot": configuration.slot, "baseline": os.environ["PLAYER_SCRIPTED"]}
     )
 
 

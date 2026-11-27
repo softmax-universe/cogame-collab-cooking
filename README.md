@@ -49,8 +49,8 @@ yield to*; the executor chooses *which tile next*. `say` is heard by your team-m
 and shown to spectators; `note` is private and comes back only to you.
 
 The same image also ships four scripted baselines, selected with
-`PLAYER_SCRIPTED=brigade|runner|passer|courier`. Every prompt seat falls back to `brigade` when a
-plan turn produces nothing usable. Public completion additionally requires
+`PLAYER_SCRIPTED=brigade|runner|passer|courier`. The engine waits for every native seat’s first accepted plan before advancing the first tick.
+An unavailable seat or exhausted plan window ends the episode unscored. Public completion additionally requires
 observed reader, player and engine joins; unresolved owners retain private
 evidence and withhold final outputs. See [training evidence](TRAINING.md).
 

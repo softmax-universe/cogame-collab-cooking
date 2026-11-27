@@ -20,7 +20,7 @@ Duplicate, late, and wrong-seat registrations are rejected. Registration records
 player inputs; it does not establish model or checkpoint identity.
 
 Native players call only their injected `COWORLD_LLM_ENDPOINT`, with authenticated
-player-slot attribution. A missing endpoint is an error, with no provider credential
+player-slot attribution. A native seat must install its first plan before tick zero. An exhausted repair or missing player control ends the episode unscored. A missing endpoint is an error, with no provider credential
 fallback. Temperature 1/top-p 1 is an explicit native profile; previous calls omitted
 these controls. Profiles may declare temperature 0–1 and an output budget up to 4096.
 

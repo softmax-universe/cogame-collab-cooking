@@ -136,6 +136,7 @@ def run_episode(
     out_dir.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / "results.json"
     replay_path = out_dir / "replay.json"
+    failure_path = out_dir / "player_failure.json"
 
     async def go() -> dict[str, Any]:
         episode = build_episode(raw_config, player_names=player_names, process_start=process_start)
@@ -149,6 +150,7 @@ def run_episode(
             ),
             generated_at="2026-08-25T12:00:00Z",
         )
+        episode.failure_sink = failure_path.write_bytes
         sockets: list[FakeSocket] = []
         if connect:
             for slot, registration in enumerate(registrations):
@@ -168,8 +170,9 @@ def run_episode(
         return {
             "episode": episode,
             "sockets": sockets,
-            "results": json.loads(results_path.read_text(encoding="utf-8")),
-            "replay_bytes": replay_path.read_bytes(),
+            "results": json.loads(results_path.read_text()) if results_path.exists() else None,
+            "replay_bytes": replay_path.read_bytes() if replay_path.exists() else b"",
+            "player_failure": json.loads(failure_path.read_bytes()) if failure_path.exists() else None,
         }
 
     return asyncio.run(go())

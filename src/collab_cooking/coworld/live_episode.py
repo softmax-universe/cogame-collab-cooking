@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import random
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -76,6 +77,7 @@ from collab_cooking.kitchens.layouts import (
 
 from .private_journal import (
     EngineApplication,
+    EngineFailure,
     EngineOutcome,
     GrantedCall,
     InstalledMacro,
@@ -111,13 +113,13 @@ class Seat:
     slot: int
     alias: str
     name: str
-    kind: str = "scripted"
-    baseline: str = DEFAULT_BASELINE
+    kind: str = "unregistered"
+    baseline: str = ""
     prompt: str = ""
     registered: bool = False
     connected: bool = False
     ever_connected: bool = False
-    fallbacks: int = 0
+    plan_rejections: int = 0
     action_fallbacks: dict[str, int] = field(
         default_factory=lambda: {"invalid_action": 0, "deadline": 0, "disconnected": 0, "malformed_frame": 0}
     )
@@ -159,7 +161,6 @@ class EpisodeConfig:
     min_plan_interval_seconds: float = 10.0
     plan_timeout_seconds: float = 12.0
     llm_max_requests_per_minute: int = 26
-    fallback_scripted: str = DEFAULT_BASELINE
     play_budget_fraction: float = 0.6
     episode_timeout_seconds: float = 1200.0
     shutdown_grace_seconds: float = 20.0
@@ -245,7 +246,6 @@ class LiveMettaGridEpisode:
                 name=truncate_runes(
                     player_names[slot] if slot < len(player_names) else f"seat-{slot}", POLICY_NAME_RUNES
                 ),
-                baseline=config.fallback_scripted,
             )
             for slot in range(len(self.tokens))
         ]
@@ -263,6 +263,8 @@ class LiveMettaGridEpisode:
         self.player_receivers: set[asyncio.Task] = set()
         self.done = False
         self.closing = False
+        self.failure: dict[str, Any] | None = None
+        self._pending_failure: tuple[int, str, str] | None = None
         self.exited = False
         self.paused = False
         self.reason = ""
@@ -271,7 +273,7 @@ class LiveMettaGridEpisode:
         self.roster = PlayerRoster()
         self.admission = PlanAdmission(config.llm_max_requests_per_minute)
         self.channels = [
-            PlanChannel(slot, self.roster, self.admission, policy_env, config.layout, config.fallback_scripted)
+            PlanChannel(slot, self.roster, self.admission, policy_env, config.layout, DEFAULT_BASELINE)
             for slot in range(len(tokens))
         ]
         self.delivered_windows = set()
@@ -303,6 +305,7 @@ class LiveMettaGridEpisode:
         )
         self.writer: replay_mod.ReplayWriter | None = None
         self._artifact_sink: Callable[[bytes, bytes], None] | None = None
+        self.failure_sink: Callable[[bytes], None] | None = None
         self.artifact_publisher: Callable[[], Awaitable[None]] | None = None
         self._pending_events: list[dict[str, Any]] = []
 
@@ -371,6 +374,16 @@ class LiveMettaGridEpisode:
         seat.ever_connected = True
         return connection_id
 
+    def _record_pending_failure(self, slot: int, kind: str, message: str) -> None:
+        if self._pending_failure is None and not self.closing and not self.done:
+            self._pending_failure = (slot, kind, message)
+            self._policy_action_event.set()
+
+    def fail_malformed_frame(self, slot: int, detail: str) -> None:
+        if 0 <= slot < len(self.seats):
+            self.seats[slot].action_fallbacks["malformed_frame"] += 1
+            self._record_pending_failure(slot, "player_error", f"seat {slot} sent malformed frame: {detail}")
+
     def disconnect_player(self, connection_id: str) -> None:
         connection = self.connections.pop(connection_id, None)
         if connection is None:
@@ -378,6 +391,9 @@ class LiveMettaGridEpisode:
         self.connections_by_slot[connection.slot].pop(connection_id, None)
         if not self.connections_by_slot[connection.slot]:
             self.seats[connection.slot].connected = False
+            self._record_pending_failure(
+                connection.slot, "episode_inconclusive", f"seat {connection.slot} disconnected"
+            )
         self._policy_action_event.set()
 
     def connected_slots(self) -> set[int]:
@@ -404,7 +420,7 @@ class LiveMettaGridEpisode:
         await asyncio.wait({task})
         error = task.exception()
         if isinstance(error, (ValidationError, ValueError)):
-            seat.action_fallbacks["malformed_frame"] += 1
+            self.fail_malformed_frame(seat.slot, "invalid player frame")
         elif error is not None:
             raise error
         self._policy_action_event.set()
@@ -431,16 +447,25 @@ class LiveMettaGridEpisode:
         if self.journal is not None:
             from .trajectory import finalize_owned
 
-            self.journal.append(OwnershipState(joined=True, reason="physics writer and player receivers terminal"))
+            self.journal.append(
+                OwnershipState(
+                    joined=self.admission.sealed,
+                    reason="complete owner receipts"
+                    if self.admission.sealed
+                    else "disconnected player lacks a terminal receipt",
+                )
+            )
             self.journal.close_joined()
-            await finalize_owned(self.journal.path, self.journal.canonical_path)
-        results = self.results()
-        if self._artifact_sink is not None and self.writer is not None:
-            self._artifact_sink(results_mod.encode(results), self.writer.encode(results))
-        if self.artifact_publisher is not None:
+            if self.admission.sealed:
+                await finalize_owned(self.journal.path, self.journal.canonical_path)
+        if self.failure is None:
+            results = self.results()
+            if self._artifact_sink is not None and self.writer is not None:
+                self._artifact_sink(results_mod.encode(results), self.writer.encode(results))
+            await self._send_final(results)
+        if self.failure is None and self.artifact_publisher is not None:
             await self.artifact_publisher()
         self.done = True
-        await self._send_final(results)
         # Certification probes /global after players start; retain its declared grace.
         await self.wait_shutdown_grace()
         self.exited = True
@@ -451,14 +476,31 @@ class LiveMettaGridEpisode:
 
     async def _play(self) -> None:
         await self._wait_for_roster()
-        if not self.connected_slots():
-            await self._settle("no_players")
+        if self._pending_failure is None:
+            for seat in self.seats:
+                if not seat.connected:
+                    self._record_pending_failure(seat.slot, "episode_inconclusive", "seat missed roster deadline")
+                    break
+        if self._pending_failure is None:
+            await self._wait_for_registrations()
+        if self._pending_failure is None:
+            self.state = replay_mod.capture(self.sim, len(self.tokens))
+            self._update_prompt_memory()
+            await self._plan_boundary(0)
+            while self._pending_failure is None and any(seat.plan_pending for seat in self._prompt_seats()):
+                await self._deliver_plans()
+                if any(seat.plan_pending for seat in self._prompt_seats()):
+                    await asyncio.sleep(0.01)
+        if self._pending_failure is not None:
+            await self._fail_episode()
             return
-        await self._wait_for_registrations()
         self._push_event({"ev": "episode_start", "layout": self.config.layout})
         self.state = replay_mod.capture(self.sim, len(self.tokens))
         await self._send_observations()
         while not self.closing and self.sim.current_step < self.config.max_steps and not self.sim.is_done():
+            if self._pending_failure is not None:
+                await self._fail_episode()
+                return
             if self.paused:
                 # The guard is NOT paused. `pause` is a spectator control that
                 # anything reaching WS /global can send, and a paused loop
@@ -473,7 +515,11 @@ class LiveMettaGridEpisode:
             tick_started = time.monotonic()
 
             await self._wait_for_policy_actions(step)
-            self._apply_actions(step)  # 1 + 2
+            if self._pending_failure is None:
+                self._apply_actions(step)  # 1 + 2
+            if self._pending_failure is not None:
+                await self._fail_episode()
+                return
             self.sim.step()  # 3
             current = replay_mod.capture(self.sim, len(self.tokens))  # 4
             events = replay_mod.derive_events(  # 5
@@ -495,7 +541,8 @@ class LiveMettaGridEpisode:
             self._record(current, events)  # 6
             self.state = current
             self._update_prompt_memory()
-            await self._plan_boundary(step)  # 7
+            if self.sim.current_step < self.config.max_steps:
+                await self._plan_boundary(int(self.sim.current_step))  # 7
             await self._deliver_plans()  # 8
             if self.sim.current_step < self.config.max_steps and not self.sim.is_done():
                 await self._send_observations()  # 9
@@ -515,7 +562,7 @@ class LiveMettaGridEpisode:
         """Bounded. Start the moment everyone is here, else at the deadline."""
         deadline = self.process_start + self.config.player_connect_timeout_seconds
         while len(self.connected_slots()) < len(self.tokens):
-            if time.monotonic() >= deadline or self._deadline_reached():
+            if self._pending_failure is not None or time.monotonic() >= deadline or self._deadline_reached():
                 return
             await asyncio.sleep(0.05)
 
@@ -527,13 +574,8 @@ class LiveMettaGridEpisode:
             await asyncio.sleep(0.02)
         for seat in self.seats:
             if not seat.registered:
-                self.roster.register(
-                    seat.slot,
-                    ScriptedRegistration.model_validate({"slot": seat.slot, "baseline": self.config.fallback_scripted}),
-                )
-                seat.kind = "scripted"
-                seat.baseline = self.config.fallback_scripted
-                seat.registered = True
+                self._record_pending_failure(seat.slot, "episode_inconclusive", "seat missed registration deadline")
+                return
         self.roster.freeze()
         if self.journal is not None:
             self.journal.append(RegisteredPolicies(registrations=[self.roster.player(slot) for slot in range(4)]))
@@ -542,7 +584,7 @@ class LiveMettaGridEpisode:
 
     async def _wait_for_policy_actions(self, step: int) -> None:
         deadline = asyncio.get_running_loop().time() + self.config.policy_action_timeout_seconds
-        while not self._policy_actions_ready(step):
+        while self._pending_failure is None and not self._policy_actions_ready(step):
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return
@@ -580,7 +622,9 @@ class LiveMettaGridEpisode:
             if admitted.cause:
                 self.seats[slot].action_fallbacks.setdefault(admitted.cause, 0)
                 self.seats[slot].action_fallbacks[admitted.cause] += 1
-                self._push_event({"ev": "action_fallback", "slot": slot, "step": step, "cause": admitted.cause})
+                kind = "episode_inconclusive" if admitted.cause in {"deadline", "disconnected"} else "player_error"
+                self._record_pending_failure(slot, kind, f"seat {slot} at tick {step}: {admitted.cause}")
+                return
             self.latest_action_indices[slot] = self.action_names.index(admitted.installed_action)
             self.applied_actions[slot] = admitted.installed_action
             self.sim.agent(slot).set_action(admitted.installed_action)
@@ -893,7 +937,7 @@ class LiveMettaGridEpisode:
                 entry.closed = True
                 entry.rejection_reason = "timeout"
             if not entry.closed and entry.rejection_reason is not None:
-                if len(entry.grants) == 2:
+                if entry.rejection_reason == "transport" or len(entry.grants) == 2:
                     entry.closed = True
                 else:
                     grant = self.admission.grant(slot, now=now)
@@ -905,6 +949,17 @@ class LiveMettaGridEpisode:
             if not entry.closed:
                 continue
             plan = entry.parsed_plan
+            if plan is None:
+                self.seats[slot].plan_rejections += 1
+                self.seats[slot].plan_pending = False
+                reason = entry.rejection_reason or "timeout"
+                kind = (
+                    "episode_inconclusive"
+                    if reason in {"timeout", "transport", "rate_budget", "disabled"}
+                    else "player_error"
+                )
+                self._record_pending_failure(slot, kind, f"seat {slot} model plan failed: {reason}")
+                return
             installed = DirectiveInstalled(
                 window_id=entry.window.window_id,
                 slot=slot,
@@ -938,7 +993,7 @@ class LiveMettaGridEpisode:
             self._beat({}, "plan", f"{seat.alias} takes {plan.station}")
             seat.plan_delivered_step = int(self.sim.current_step)
         else:
-            seat.fallbacks += 1
+            seat.plan_rejections += 1
             self._push_event({"ev": "fallback", "slot": slot, "alias": seat.alias, "cause": installed.cause})
 
     # -- messages -----------------------------------------------------------
@@ -1036,7 +1091,7 @@ class LiveMettaGridEpisode:
             aliases=[seat.alias for seat in self.seats],
             seat_kinds=[seat.seat_kind for seat in self.seats],
             disconnected=[not seat.ever_connected for seat in self.seats],
-            fallbacks=[seat.fallbacks for seat in self.seats],
+            plan_rejections=[seat.plan_rejections for seat in self.seats],
             action_fallbacks=[seat.action_fallbacks for seat in self.seats],
             llm_requests=sum(len(entry.grants) for entry in self.admission.history.values()),
         )
@@ -1058,6 +1113,8 @@ class LiveMettaGridEpisode:
                     }
                 )
                 required = {seat.slot for seat in self.seats if seat.ever_connected}
+                if self.failure is not None:
+                    required.intersection_update(self.connected_slots())
                 while not all(self.channels[slot].acknowledged for slot in required):
                     self._policy_action_event.clear()
                     if all(self.channels[slot].acknowledged for slot in required):
@@ -1076,8 +1133,9 @@ class LiveMettaGridEpisode:
                 )
                 if not await lifecycle.settle(self.player_receivers, deadline, cancel=False):
                     raise lifecycle.OwnershipUnsettled("game socket receivers did not join before sealing")
-            self.admission.seal()
-            players_joined = True
+            players_joined = all(self.channels[seat.slot].acknowledged for seat in self.seats if seat.ever_connected)
+            if players_joined:
+                self.admission.seal()
         finally:
             if self.journal is not None:
                 self.journal.append(
@@ -1110,6 +1168,8 @@ class LiveMettaGridEpisode:
                 error = task.exception()
                 if error is not None:
                     raise error
+        if self.done:
+            return True
         await self.stop_players(deadline)
         if self.journal is not None and not self.journal.closed:
             self.journal.append(
@@ -1120,7 +1180,24 @@ class LiveMettaGridEpisode:
             self.journal.close_joined()
         return True
 
+    async def _fail_episode(self) -> None:
+        assert self._pending_failure is not None
+        slot, kind, message = self._pending_failure
+        self.failure = {"failed_policy_index": slot, "kind": kind, "message": message}
+        if self.journal is not None:
+            self.journal.append(EngineFailure(failed_policy_index=slot, failure_kind=kind, message=message))
+        if self.failure_sink is not None:
+            self.failure_sink(json.dumps(self.failure).encode())
+            if self.artifact_publisher is not None:
+                await self.artifact_publisher()
+        self.reason = kind
+        self.closing = True
+        await self.stop_players(lifecycle.cleanup_deadline())
+
     async def _settle(self, reason: str) -> None:
+        if self._pending_failure is not None:
+            await self._fail_episode()
+            return
         self.reason = reason
         self.closing = True
         if reason == "deadline":

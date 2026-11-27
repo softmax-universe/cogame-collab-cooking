@@ -7,11 +7,15 @@ from collab_cooking.coworld.prompts import RULE_TEMPLATES, PromptSelection
 SYSTEM_TEMPLATE = """Kitchen: {layout} - {layout_line}
 You give one standing order; a controller walks you there tick by tick until your next order,
 about {plan_interval} ticks from now.
-Reply with a single JSON object and NOTHING else. Your reply MUST begin with the character {{.
+Reply with ONLY a single JSON object (optionally in a ```json ... ``` fence) and no extra prose.
 Schema:
 {{"station":"<one of LEGAL STATIONS>","recipe":"salad|soup|fries|any","zone":"left|right|pass|any",
  "handoff":"<ally alias or none>","yield_to":"<ally alias or none>",
  "say":"<=120 chars","note":"<=200 chars"}}
+Only "station" is required; omitted fields default to recipe="any", zone="any", handoff="none",
+yield_to="none", say="", note="".
+Example:
+{{"station":"chop","recipe":"soup","zone":"any","handoff":"none","yield_to":"none","say":"Chopping veg for soup","note":""}}
 "say" is heard by your team-mates next turn and shown to spectators. "note" is private and is
 handed back only to you."""
 

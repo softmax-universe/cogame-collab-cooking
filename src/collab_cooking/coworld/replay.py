@@ -75,7 +75,8 @@ EVENT_NAMES: tuple[str, ...] = (
     "wash_done",
     "blocked",
     "plan",
-    "fallback",
+    "plan_rejected",
+    "action_fallback",
     "deadline",
     "episode_end",
 )

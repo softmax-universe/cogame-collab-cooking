@@ -151,7 +151,7 @@ def test_a_paused_episode_still_settles_at_the_deadline(tmp_path: Path) -> None:
     assert out["replay_bytes"], "a paused episode still writes both artifacts"
 
 
-def test_no_players_writes_zeroed_results_and_exits_zero(tmp_path: Path) -> None:
+def test_no_players_fails_unscored_without_results(tmp_path: Path) -> None:
     config = fast_cert_config(
         max_steps=120,
         step_seconds=0.0,
@@ -159,15 +159,19 @@ def test_no_players_writes_zeroed_results_and_exits_zero(tmp_path: Path) -> None
         player_connect_timeout_seconds=0.2,
     )
     out = run_episode(config, [], tmp_path, connect=False)
-    results = out["results"]
-    assert results["reason"] == "no_players"
-    assert results["scores"] == [0.0, 0.0, 0.0, 0.0]
-    assert results["delivered"] == [0, 0, 0, 0]
-    assert results["disconnected"] == [True, True, True, True]
-    assert out["replay_bytes"], "a no_players episode still writes a replay"
+    assert out["results"] is None
+    assert out["replay_bytes"] == b""
+    assert out["player_failure"] is not None
+    assert out["player_failure"]["kind"] == "episode_inconclusive"
+    assert out["player_failure"]["failed_policy_index"] == 0
 
 
-def test_an_unreachable_native_endpoint_keeps_scripted_physics_and_records_transport_fallback(tmp_path: Path) -> None:
+def test_a_prompt_seat_with_no_credentials_fails_unscored_before_first_tick(monkeypatch, tmp_path: Path) -> None:
+    traj_path = tmp_path / "disabled_trajectory.jsonl"
+    monkeypatch.setenv("COGAME_SAVE_TRAJECTORY_URI", f"file://{traj_path}")
+    monkeypatch.setenv("COWORLD_EPISODE_ID", "ep-disabled")
+    monkeypatch.setenv("COWORLD_GAME_VERSION", "0.1.10")
+    monkeypatch.setenv("COWORLD_SOURCE_REVISION", "test-rev")
     out = run_episode(
         fast_cert_config(
             max_steps=180,
@@ -184,13 +188,16 @@ def test_an_unreachable_native_endpoint_keeps_scripted_physics_and_records_trans
         ],
         tmp_path,
     )
-    results = out["results"]
-    assert results["reason"] == "complete"
-    assert results["llm_requests"] > 0, "issued native calls are retained despite observed connection refusal"
-    assert results["fallbacks"][0] > 0
-    replay = json.loads(out["replay_bytes"].decode("utf-8"))
-    causes = {event["cause"] for tick in replay["ticks"] for event in tick.get("ev", []) if event["ev"] == "fallback"}
-    assert causes == {"transport"}
+    assert out["results"] is None
+    assert out["replay_bytes"] == b""
+    assert out["player_failure"] is not None
+    assert out["player_failure"]["kind"] == "episode_inconclusive"
+    assert out["player_failure"]["failed_policy_index"] == 0
+    assert int(out["episode"].sim.current_step) == 0
+    assert out["sockets"][0].actions == []
+    ep_event = json.loads(traj_path.read_bytes())["episode"]
+    assert ep_event["status"] == "failed"
+    assert ep_event["participant_outcomes"] is None
 
 
 def test_the_certification_fixture_settles_well_inside_the_certify_timeout(tmp_path: Path) -> None:
@@ -219,7 +226,7 @@ def test_every_player_saw_the_final_frame(tmp_path: Path) -> None:
         assert len(socket.final["aliases"]) == 4
 
 
-def test_action_fallbacks_distinguish_policy_errors_from_missing_actions(monkeypatch, tmp_path: Path) -> None:
+def test_malformed_controls_stop_before_scoring(monkeypatch, tmp_path: Path) -> None:
     from uuid import uuid4
 
     from tests.harness import FakeSocket
@@ -253,23 +260,249 @@ def test_action_fallbacks_distinguish_policy_errors_from_missing_actions(monkeyp
         [scripted_registration() for _ in range(4)],
         tmp_path,
     )
-    assert out["results"]["reason"] == "complete"
-    manifest = json.loads((Path(__file__).parents[1] / "coworld_manifest_template.json").read_text())
-    schema = manifest["game"]["results_schema"]
-    assert set(out["results"]) == set(schema["properties"]) == set(schema["required"])
-    counts = out["results"]["action_fallbacks"]
-    assert counts[0] == counts[3] == {"invalid_action": 0, "deadline": 0, "disconnected": 0, "malformed_frame": 0}
-    assert counts[1] == {
-        "invalid_action": 0,
-        "deadline": 0,
-        "disconnected": 0,
-        "malformed_frame": 0,
-        "executor_mismatch": 6,
+    assert out["results"] is None
+    assert not out["replay_bytes"]
+    assert out["player_failure"]["kind"] == "player_error"
+    assert int(out["episode"].sim.current_step) == 0
+
+
+@pytest.mark.parametrize("scenario", ["success", "http_503", "invalid_plan", "malformed_action", "player_loss"])
+def test_real_server_and_player_websocket_end_to_end(tmp_path: Path, scenario: str) -> None:
+    """Exercise the complete real server and player processes over real WebSockets
+    against a deterministic local HTTP model fixture for the scored and unscored outcomes."""
+    import asyncio
+    import os
+    import socket
+    import subprocess
+    import sys
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    import websockets
+
+    http_calls: list[dict] = []
+
+    class FixtureHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            http_calls.append({"path": self.path, "slot": self.headers.get("X-Coworld-Player-Slot", ""), "body": body})
+            if scenario == "http_503":
+                payload = b'{"error":"unavailable"}'
+                self.send_response(503)
+            else:
+                payload = json.dumps(
+                    {
+                        "id": f"msg-{len(http_calls)}",
+                        "model": "fixture/collab_cooking",
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 10, "output_tokens": 12},
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": '{"station":"unavailable"}'
+                                if scenario == "invalid_plan"
+                                else '{"station":"chop","recipe":"soup","say":"on it"}',
+                            }
+                        ],
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    http_server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
+    http_thread = Thread(target=http_server.serve_forever, daemon=True)
+    http_thread.start()
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        game_port = sock.getsockname()[1]
+
+    work = tmp_path / scenario
+    work.mkdir(parents=True, exist_ok=True)
+    config_path = work / "config.json"
+    results_path = work / "results.json"
+    replay_path = work / "replay.json"
+    failure_path = work / "player_failure.json"
+    traj_path = work / "trajectory.jsonl"
+
+    config = fast_cert_config(
+        max_steps=20,
+        step_seconds=0.01,
+        policy_action_timeout_seconds=1.0,
+        shutdown_grace_seconds=0.0,
+        player_connect_timeout_seconds=15,
+        plan_interval_steps=10,
+        min_plan_interval_seconds=0.0,
+    )
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    game_env = {
+        **os.environ,
+        "COGAME_HOST": "127.0.0.1",
+        "COGAME_PORT": str(game_port),
+        "COGAME_CONFIG_URI": f"file://{config_path}",
+        "COGAME_RESULTS_URI": f"file://{results_path}",
+        "COGAME_SAVE_REPLAY_URI": f"file://{replay_path}",
+        "COGAME_PLAYER_FAILURE_URI": f"file://{failure_path}",
+        "COGAME_SAVE_TRAJECTORY_URI": f"file://{traj_path}",
+        "COWORLD_EPISODE_ID": f"ep-ws-{scenario}",
+        "COWORLD_GAME_VERSION": "0.1.10",
+        "COWORLD_SOURCE_REVISION": "test-rev",
+        "COWORLD_LLM_ENDPOINT": f"http://127.0.0.1:{http_server.server_port}",
+        "COWORLD_LLM_MODEL": "fixture/collab_cooking",
     }
-    assert counts[2] == {"invalid_action": 0, "deadline": 6, "disconnected": 0, "malformed_frame": 6}
-    replay = json.loads(out["replay_bytes"])
-    events = [
-        event for tick in replay["ticks"] if "ev" in tick for event in tick["ev"] if event["ev"] == "action_fallback"
-    ]
-    assert len(events) == 12
-    assert {event["cause"] for event in events} == {"executor_mismatch", "deadline"}
+
+    game_proc = subprocess.Popen(
+        [sys.executable, "-m", "collab_cooking.coworld.server"],
+        env=game_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    player_procs: list[subprocess.Popen[str]] = []
+    try:
+        # Wait for /healthz
+        import urllib.request
+
+        for _ in range(100):
+            if game_proc.poll() is not None:
+                raise RuntimeError(f"game exited early: {game_proc.stderr.read() if game_proc.stderr else ''}")
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{game_port}/healthz", timeout=1) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.05)
+
+        seat_envs = [
+            {"PLAYER_PROMPT": "Coordinate with the team."},
+            {"PLAYER_SCRIPTED": "brigade"},
+            {"PLAYER_SCRIPTED": "passer"},
+            {"PLAYER_SCRIPTED": "courier"},
+        ]
+        spawn_slots = range(4) if scenario in ("success", "http_503", "invalid_plan") else range(3)
+        for slot in spawn_slots:
+            env = {
+                **os.environ,
+                "COWORLD_LLM_ENDPOINT": game_env["COWORLD_LLM_ENDPOINT"],
+                "COWORLD_PLAYER_WS_URL": f"ws://127.0.0.1:{game_port}/player?slot={slot}&token=token-{slot}",
+                **seat_envs[slot],
+            }
+            env.pop("PLAYER_PROMPT" if "PLAYER_SCRIPTED" in seat_envs[slot] else "PLAYER_SCRIPTED", None)
+            player_procs.append(
+                subprocess.Popen(
+                    [sys.executable, "-m", "collab_cooking.coworld.player"],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
+
+        if scenario in ("malformed_action", "player_loss"):
+
+            async def bad_slot_3() -> None:
+                url = f"ws://127.0.0.1:{game_port}/player?slot=3&token=token-3"
+                async with websockets.connect(url) as ws:
+                    _ = json.loads(await ws.recv())  # player_config
+                    await ws.send(json.dumps({"type": "register", "kind": "external", "slot": 3}))
+                    msg = json.loads(await ws.recv())
+                    assert msg["type"] == "observation"
+                    if scenario == "malformed_action":
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "type": "action",
+                                    "action_name": "illegal_teleport",
+                                    "slot": 3,
+                                    "request_id": msg["request_id"],
+                                }
+                            )
+                        )
+                        stop = json.loads(await ws.recv())
+                        assert stop["type"] == "stop"
+                        await ws.send(json.dumps({"type": "stopped", "request_id": stop["request_id"], "joined": True}))
+                        receipt = json.loads(await ws.recv())
+                        assert receipt["type"] == "evidence_received"
+                    else:
+                        await ws.close()
+
+            asyncio.run(bad_slot_3())
+
+        game_proc.wait(timeout=30)
+        for proc in player_procs:
+            proc.wait(timeout=15)
+    finally:
+        for proc in player_procs:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
+        if game_proc.poll() is None:
+            game_proc.terminate()
+            game_proc.wait(timeout=5)
+        http_server.shutdown()
+        http_server.server_close()
+        http_thread.join()
+
+    assert game_proc.returncode == 0
+    assert all(proc.returncode == 0 for proc in player_procs)
+    if scenario == "player_loss":
+        assert not results_path.exists() and not replay_path.exists()
+        failure = json.loads(failure_path.read_bytes())
+        assert failure["kind"] == "episode_inconclusive" and failure["failed_policy_index"] == 3
+        assert not traj_path.exists(), "a disconnected owner cannot acknowledge its receiver join"
+        return
+    ep_event = json.loads(traj_path.read_bytes())["episode"]
+
+    if scenario == "success":
+        assert results_path.exists()
+        assert replay_path.exists()
+        assert not failure_path.exists()
+        results = json.loads(results_path.read_text(encoding="utf-8"))
+        assert results["reason"] == "complete"
+        from collab_cooking.coworld.results import seat_scores
+
+        assert results["cross_play"] is True
+        assert results["seat_kinds"] == ["prompt", "scripted:brigade", "scripted:passer", "scripted:courier"]
+        assert results["dishes"] == sum(results["delivered"])
+        assert results["scores"] == seat_scores(results["delivered"])
+        assert results["steps"] == 20
+        assert results["llm_requests"] >= 1
+        assert len(http_calls) >= 1
+        assert all(all(v == 0 for v in fb.values()) for fb in results["action_fallbacks"])
+        assert ep_event["status"] == "completed"
+        assert ep_event["participant_outcomes"] == results["scores"]
+    elif scenario == "invalid_plan":
+        assert not results_path.exists() and not replay_path.exists()
+        failure = json.loads(failure_path.read_bytes())
+        assert failure["kind"] == "player_error" and failure["failed_policy_index"] == 0
+        assert len(http_calls) == 2
+        assert ep_event["status"] == "failed" and ep_event["participant_outcomes"] is None
+        decision = json.loads(traj_path.read_bytes())["decisions"][0]
+        assert len(decision["attempts"]) == 2
+        assert all("unavailable" in attempt["raw_response"] for attempt in decision["attempts"])
+    elif scenario == "http_503":
+        assert not results_path.exists()
+        assert not replay_path.exists()
+        assert failure_path.exists()
+        failure = json.loads(failure_path.read_text(encoding="utf-8"))
+        assert failure["kind"] == "episode_inconclusive"
+        assert failure["failed_policy_index"] == 0
+        assert len(http_calls) == 1
+        assert ep_event["status"] == "failed"
+        assert ep_event["participant_outcomes"] is None
+    elif scenario == "malformed_action":
+        assert not results_path.exists()
+        assert not replay_path.exists()
+        assert failure_path.exists()
+        failure = json.loads(failure_path.read_text(encoding="utf-8"))
+        assert failure["kind"] == "player_error"
+        assert failure["failed_policy_index"] == 3
+        assert ep_event["status"] == "failed"
+        assert ep_event["participant_outcomes"] is None

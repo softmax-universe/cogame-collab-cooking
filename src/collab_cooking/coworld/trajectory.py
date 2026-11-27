@@ -28,6 +28,7 @@ from .plans import parse_plan
 from .private_journal import (
     RECORD,
     EngineApplication,
+    EngineFailure,
     EngineOutcome,
     GrantedCall,
     InstalledMacro,
@@ -113,7 +114,7 @@ def finalize(source: Path, destination: Path) -> None:
                 "CREATE TABLE controls(window TEXT, tick INTEGER, action INTEGER, vibe INTEGER, cause TEXT);"
             )
             source_record: SourceRecord | None = None
-            outcome: EngineOutcome | None = None
+            outcome: EngineOutcome | EngineFailure | None = None
             policies: RegisteredPolicies | None = None
             joined: dict[str, bool] = {}
             last_tick = -1
@@ -191,7 +192,7 @@ def finalize(source: Path, destination: Path) -> None:
                                     control.cause,
                                 ),
                             )
-                elif isinstance(record, EngineOutcome):
+                elif isinstance(record, (EngineOutcome, EngineFailure)):
                     if outcome is not None:
                         raise ValueError("private engine outcome repeated")
                     outcome = record
@@ -199,7 +200,7 @@ def finalize(source: Path, destination: Path) -> None:
                     joined[record.scope] = record.joined
             if (
                 source_record is None
-                or policies is None
+                or (policies is None and not isinstance(outcome, EngineFailure))
                 or outcome is None
                 or any(joined.get(scope) is not True for scope in ("engine", "players", "episode"))
             ):
@@ -220,24 +221,26 @@ def finalize(source: Path, destination: Path) -> None:
                 "source_revision": identity["source_revision"],
                 "image_digest": identity["image_digest"],
             }
+            registrations = [] if policies is None else policies.registrations
+            failed = isinstance(outcome, EngineFailure)
             summary = EpisodeEvent.model_validate(
                 {
                     **common,
                     "event_type": "episode",
                     "schema_version": "1",
                     "seed_family": source_record.seed_family,
-                    "status": "completed" if outcome.reason == "complete" else "truncated",
+                    "status": "failed" if failed else "completed" if outcome.reason == "complete" else "truncated",
                     "outcome": {
-                        "results": outcome.results,
+                        **({"failure": outcome.model_dump(mode="json")} if failed else {"results": outcome.results}),
                         "runtime_configuration": source_record.runtime_configuration,
                         "evidence_profile": source_record.evidence_profile,
                         "physical_evidence_sha256": digest,
                         "physical_evidence_file": source.name,
-                        "registered_policies": policies.model_dump(mode="json")["registrations"],
+                        "registered_policies": [registration.model_dump(mode="json") for registration in registrations],
                         "slot_to_engine_seat": {str(slot): slot for slot in range(4)},
                         "ownership": joined,
                     },
-                    "participant_outcomes": outcome.results["scores"],
+                    "participant_outcomes": None if failed else outcome.results["scores"],
                 }
             )
             with tempfile.NamedTemporaryFile(dir=destination.parent, mode="w+b", delete=False) as output:
@@ -252,7 +255,7 @@ def finalize(source: Path, destination: Path) -> None:
                         issued = RECORD.validate_json(raw.readline(MAX_JOURNAL_LINE + 1))
                         assert isinstance(issued, PrivateWindow)
                         window = issued.window
-                        registration = next(item for item in policies.registrations if item.slot == window.slot)
+                        registration = next(item for item in registrations if item.slot == window.slot)
                         if not isinstance(registration, NativeRegistration) or registration.profile != window.profile:
                             raise ValueError("native window differs from its frozen assigned policy profile")
                         directive: InstalledMacro | None = None

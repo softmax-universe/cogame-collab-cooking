@@ -135,8 +135,20 @@ def create_app(config: dict[str, Any], request_shutdown: Callable[[], None]) -> 
     results_path = output_path_for(results_uri, "results.json")
     replay_path = output_path_for(replay_uri, "replay.json") if replay_uri else None
 
+    failure_uri = os.environ.get("COGAME_PLAYER_FAILURE_URI")
+    failure_path = output_path_for(failure_uri, "player_failure.json") if failure_uri else None
+
     async def publish_artifacts() -> None:
         deadline = asyncio.get_running_loop().time() + ARTIFACT_SECONDS
+        if failure_uri and failure_path and failure_path.exists():
+            if urlparse(failure_uri).scheme != "file":
+                await write_uri(
+                    failure_uri,
+                    failure_path.read_bytes(),
+                    method=os.environ.get("COGAME_PLAYER_FAILURE_METHOD"),
+                    deadline=deadline,
+                )
+            return
         if urlparse(results_uri).scheme != "file" and results_path.exists():
             await write_uri(
                 results_uri,
@@ -158,6 +170,8 @@ def create_app(config: dict[str, Any], request_shutdown: Callable[[], None]) -> 
         replay_path=replay_path,
         request_shutdown=request_shutdown,
     )
+    if failure_path is not None:
+        game.episode.failure_sink = failure_path.write_bytes
     game.episode.artifact_publisher = publish_artifacts
     app = FastAPI()
 
@@ -175,12 +189,12 @@ def create_app(config: dict[str, Any], request_shutdown: Callable[[], None]) -> 
     def player_client() -> HTMLResponse:
         return HTMLResponse((CLIENT_DIR / "player.html").read_text(encoding="utf-8"))
 
-    async def received_packets(websocket: WebSocket) -> AsyncIterator[dict[str, Any]]:
+    async def received_packets(websocket: WebSocket, *, slot: int | None = None) -> AsyncIterator[dict[str, Any]]:
         while True:
             packet = await websocket.receive()
             if packet["type"] == "websocket.disconnect":
                 return
-            raw = packet["text"]
+            raw = packet.get("text")
 
             async def decode(raw=raw) -> dict[str, Any]:
                 value = json.loads(raw)
@@ -191,6 +205,9 @@ def create_app(config: dict[str, Any], request_shutdown: Callable[[], None]) -> 
             decoding = lifecycle.owned_task(decode())
             await asyncio.wait({decoding})
             if decoding.exception() is not None:
+                if slot is not None:
+                    game.episode.fail_malformed_frame(slot, "invalid WebSocket JSON packet")
+                    continue
                 raise ValueError("invalid WebSocket JSON packet") from None
             yield decoding.result()
 
@@ -242,7 +259,7 @@ def create_app(config: dict[str, Any], request_shutdown: Callable[[], None]) -> 
         game.episode.player_receivers.add(receiver)
         connection_id = await game.episode.connect_player(slot, websocket)
         try:
-            async for message in received_packets(websocket):
+            async for message in received_packets(websocket, slot=slot):
                 await game.episode.handle_player_message(connection_id, message)
         finally:
             game.episode.disconnect_player(connection_id)
